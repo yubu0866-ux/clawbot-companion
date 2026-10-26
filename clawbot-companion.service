@@ -1,0 +1,21 @@
+[Unit]
+Description=clawbot-companion WeChat companion bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# TODO: set User to the OS account that should run the service
+# User=your-username
+# TODO: set WorkingDirectory to your clone of this repository (no machine-specific path is shipped)
+# WorkingDirectory=/path/to/clawbot-companion
+ExecStart=/path/to/clawbot-companion/start.sh
+Restart=on-failure
+RestartSec=10
+# Optional: provide the API key via an EnvironmentFile (git-ignored .env), never inline in this unit
+# EnvironmentFile=/path/to/clawbot-companion/.env
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

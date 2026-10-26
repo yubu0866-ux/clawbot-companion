@@ -1,0 +1,30 @@
+# Runtime state & session — never commit
+state/
+session.json
+
+# Real config files (only *.example.* belong in git)
+config.json
+persona.json
+facts.json
+*.env
+.env
+
+# Agent-mode file queues
+inbox/
+outbox/
+
+# Generated media
+media_out/
+media/
+*.mp4
+*.mov
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Logs & OS
+*.log
+.DS_Store
