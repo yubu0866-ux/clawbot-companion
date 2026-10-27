@@ -25,7 +25,6 @@ CLI：
 import argparse
 import base64
 import binascii
-import fcntl
 import functools
 import json
 import os
@@ -39,6 +38,35 @@ import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
+# ---- 跨平台文件锁（portable lock shim）----
+# POSIX 用 fcntl.flock；Windows 没有 fcntl，改用 msvcrt.locking 对锁文件
+# 第 0 字节加范围锁。语义对齐：默认阻塞等锁，nb=True 时冲突立即抛
+# OSError（与 flock LOCK_NB 一致）；msvcrt 的阻塞锁约 10 秒后放弃并抛
+# OSError，本桥的锁都很短暂，不构成实际差异。
+try:
+    import fcntl
+
+    def _flock_ex(fd, nb=False):
+        fcntl.flock(fd, fcntl.LOCK_EX | (fcntl.LOCK_NB if nb else 0))
+
+    def _flock_un(fd):
+        fcntl.flock(fd, fcntl.LOCK_UN)
+except ImportError:  # Windows
+    import msvcrt
+
+    def _flock_ex(fd, nb=False):
+        fh = fd if isinstance(fd, int) else fd.fileno()
+        if os.fstat(fh).st_size == 0:
+            os.lseek(fh, 0, os.SEEK_SET)
+            os.write(fh, b"\0")
+        os.lseek(fh, 0, os.SEEK_SET)
+        msvcrt.locking(fh, msvcrt.LK_NBLCK if nb else msvcrt.LK_LOCK, 1)
+
+    def _flock_un(fd):
+        fh = fd if isinstance(fd, int) else fd.fileno()
+        os.lseek(fh, 0, os.SEEK_SET)
+        msvcrt.locking(fh, msvcrt.LK_UNLCK, 1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 与 bridge.py 一致：测试可用 COMPANION_HOME 把数据目录指到沙箱
@@ -344,14 +372,14 @@ def state_lock():
     os.makedirs(STATE, exist_ok=True)
     fd = os.open(os.path.join(STATE, ".lock"), os.O_CREAT | os.O_RDWR, 0o644)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        _flock_ex(fd)
         _LOCK_FD, _LOCK_DEPTH = fd, 1
         try:
             yield
         finally:
             _LOCK_FD, _LOCK_DEPTH = None, 0
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                _flock_un(fd)
             except OSError:
                 pass
             os.close(fd)

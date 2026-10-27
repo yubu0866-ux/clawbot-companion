@@ -61,6 +61,8 @@ LAUGH_MARKERS = ("[laughter]", "[laughing]", "(laughter)", "(laughing)",
 
 
 def run(cmd, **kw):
+    kw.setdefault("encoding", "utf-8")  # Windows 区域编码会误解码 ffmpeg 输出
+    kw.setdefault("errors", "replace")
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 

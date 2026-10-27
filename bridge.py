@@ -16,7 +16,6 @@ COMPANION_PAUSE_14_SEC 覆盖 -14 暂停秒数（默认 300）。
 """
 import argparse
 import base64
-import fcntl
 import hashlib
 import http.client
 import json
@@ -35,6 +34,35 @@ import urllib.parse
 import urllib.request
 import uuid
 from zoneinfo import ZoneInfo
+
+# ---- 跨平台文件锁（portable lock shim）----
+# POSIX 用 fcntl.flock；Windows 没有 fcntl，改用 msvcrt.locking 对锁文件
+# 第 0 字节加范围锁。语义对齐：默认阻塞等锁，nb=True 时冲突立即抛
+# OSError（与 flock LOCK_NB 一致）；msvcrt 的阻塞锁约 10 秒后放弃并抛
+# OSError，本桥的锁都很短暂，不构成实际差异。
+try:
+    import fcntl
+
+    def _flock_ex(fd, nb=False):
+        fcntl.flock(fd, fcntl.LOCK_EX | (fcntl.LOCK_NB if nb else 0))
+
+    def _flock_un(fd):
+        fcntl.flock(fd, fcntl.LOCK_UN)
+except ImportError:  # Windows
+    import msvcrt
+
+    def _flock_ex(fd, nb=False):
+        fh = fd if isinstance(fd, int) else fd.fileno()
+        if os.fstat(fh).st_size == 0:
+            os.lseek(fh, 0, os.SEEK_SET)
+            os.write(fh, b"\0")
+        os.lseek(fh, 0, os.SEEK_SET)
+        msvcrt.locking(fh, msvcrt.LK_NBLCK if nb else msvcrt.LK_LOCK, 1)
+
+    def _flock_un(fd):
+        fh = fd if isinstance(fd, int) else fd.fileno()
+        os.lseek(fh, 0, os.SEEK_SET)
+        msvcrt.locking(fh, msvcrt.LK_UNLCK, 1)
 
 HOME = os.environ.get("COMPANION_HOME") or os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(HOME, "state")
@@ -225,7 +253,7 @@ class _StateLock:
         self._fd = None
         try:
             self._fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
-            fcntl.flock(self._fd, fcntl.LOCK_EX)
+            _flock_ex(self._fd)
         except OSError:
             pass
         return self
@@ -233,7 +261,7 @@ class _StateLock:
     def __exit__(self, *exc):
         if self._fd is not None:
             try:
-                fcntl.flock(self._fd, fcntl.LOCK_UN)
+                _flock_un(self._fd)
                 os.close(self._fd)
             except OSError:
                 pass
@@ -273,12 +301,13 @@ def atomic_write_json(path, data, mode=0o644):
         os.chmod(path, mode)
     except OSError:
         pass
-    try:
-        dfd = os.open(os.path.dirname(path) or ".", os.O_DIRECTORY)
-        os.fsync(dfd)
-        os.close(dfd)
-    except OSError:
-        pass
+    if hasattr(os, "O_DIRECTORY"):  # 目录 fsync 仅 POSIX 有此概念
+        try:
+            dfd = os.open(os.path.dirname(path) or ".", os.O_DIRECTORY)
+            os.fsync(dfd)
+            os.close(dfd)
+        except OSError:
+            pass
 
 
 def write_json_locked(path, data, mode=0o644):
@@ -732,14 +761,36 @@ def _libcrypto():
     加密/解密窗口期读到（/proc/<pid>/cmdline）。改走 ctypes 直调 libcrypto
     的 EVP 接口后，密钥只存在于本进程内存。环境无新依赖：openssl CLI 本身
     就链接 libcrypto，find_library 必然命中；加载失败宁可抛错也不回退到
-    argv 传密钥的旧路径（回退即重新引入暴露面）。"""
+    argv 传密钥的旧路径（回退即重新引入暴露面）。Windows 的 libcrypto
+    候选见下方 candidates（CPython 自带 DLLs\\libcrypto-3.dll 等）。"""
     global _LIBCRYPTO
     if _LIBCRYPTO is not None:
         return _LIBCRYPTO
     import ctypes
     import ctypes.util
-    name = ctypes.util.find_library("crypto") or "libcrypto.so.3"
-    lib = ctypes.CDLL(name)
+    candidates = [ctypes.util.find_library("crypto")]
+    if os.name == "nt":
+        # Windows：CPython 安装目录自带 libcrypto-3.dll（DLLs 子目录，
+        # _ssl 模块同款）；conda 在 Library\bin；最后退到 PATH 裸名。
+        exe_dir = os.path.dirname(sys.executable)
+        for base in (exe_dir, os.path.join(exe_dir, "DLLs"),
+                     os.path.join(sys.prefix, "Library", "bin")):
+            for dll in ("libcrypto-3.dll", "libcrypto-1_1.dll", "libeay32.dll"):
+                candidates.append(os.path.join(base, dll))
+        candidates += ["libcrypto-3.dll", "libcrypto-1_1.dll", "libeay32.dll"]
+    else:
+        candidates.append("libcrypto.so.3")
+    lib = None
+    for cand in candidates:
+        if not cand:
+            continue
+        try:
+            lib = ctypes.CDLL(cand)
+            break
+        except OSError:
+            continue
+    if lib is None:
+        raise RuntimeError("无法加载 libcrypto（进程内 AES 不可用）")
     vp = ctypes.c_void_p
     lib.EVP_CIPHER_CTX_new.restype = vp
     lib.EVP_CIPHER_CTX_free.argtypes = [vp]
@@ -2876,7 +2927,7 @@ def cmd_serve(args):
     global _INSTANCE_LOCK_FD
     inst_fd = os.open(INSTANCE_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
     try:
-        fcntl.flock(inst_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _flock_ex(inst_fd, nb=True)
     except OSError:
         os.close(inst_fd)
         serve_log("serve 抢锁失败：已有实例在运行，本进程以 75 退出")
@@ -3120,12 +3171,14 @@ def cmd_resume(args):
 
 def cmd_logout(args):
     ensure_dirs()
-    # 停 serve：优先 systemd，其次 pid
-    try:
-        subprocess.run(["systemctl", "stop", "wechat-bridge"], timeout=20,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
+    # 停 serve：Linux 下优先 systemd（本仓库 unit 名 clawbot-companion），
+    # 其次 pid；Windows 无 systemctl，跳过、直接走 pid 路径。
+    if os.name == "posix" and shutil.which("systemctl"):
+        try:
+            subprocess.run(["systemctl", "stop", "clawbot-companion"], timeout=20,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
     pid = _serve_alive()
     if pid:
         try:

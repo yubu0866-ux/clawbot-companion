@@ -126,7 +126,10 @@ def _discover_stt_python():
     home = os.path.expanduser("~")
     for pat in (os.path.join(home, "*venv*", "bin", "python"),
                 os.path.join(home, ".venvs", "*", "bin", "python"),
-                os.path.join(home, "workspace", "*venv*", "bin", "python")):
+                os.path.join(home, "workspace", "*venv*", "bin", "python"),
+                os.path.join(home, "*venv*", "Scripts", "python.exe"),
+                os.path.join(home, ".venvs", "*", "Scripts", "python.exe"),
+                os.path.join(home, "workspace", "*venv*", "Scripts", "python.exe")):
         cands.extend(sorted(glob.glob(pat)))
     for c in cands:
         if not c or not os.path.exists(c):

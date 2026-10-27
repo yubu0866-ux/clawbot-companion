@@ -1,0 +1,8 @@
+# clawbot-companion 运行依赖（Python >= 3.10，推荐 3.12）
+Pillow>=10.0        # bridge.py 媒体处理（图片探测/处理）
+numpy>=1.26         # scripts/audio_screen.py、scripts/audio_repair.py 音频筛查
+tzdata>=2024.1; sys_platform == "win32"   # Windows 没有系统时区数据库，zoneinfo 依赖它
+
+# 可选依赖（未装时相关检查自动 SKIP，不影响主链路）：
+#   faster-whisper  本地语音转写（音频筛查的 whisper 项）；体积较大（含 torch），按需安装
+#   ffmpeg          系统工具（非 pip 包）：视频抽帧与音频响度测量用，见 docs/windows.md

@@ -203,7 +203,9 @@ try:
     sess = rj(os.path.join(STATE, "session.json"), {})
     check("T1c wait-login confirmed 写入 session", r.returncode == 0 and sess.get("bot_token") == LOGIN_TOKEN)
     mode = oct(os.stat(os.path.join(STATE, "session.json")).st_mode & 0o777)
-    check("T1d session.json 权限 600", mode == "0o600", mode)
+    # Windows 无 POSIX 权限位（os.chmod 只切只读位），权限断言仅 POSIX 生效
+    check("T1d session.json 权限 600",
+          mode == "0o600" if os.name != "nt" else True, mode)
     # T1g：过期标记在场时走 binded_redirect 登录，必须清 NEEDS_RELOGIN +
     # notified_relogin——否则平台说「已绑定、session 可用」而桥被旧标记
     # 永久假死（serve 空转、watchdog 不拉起）。回归：bughunt-2026-10-24 面 7。

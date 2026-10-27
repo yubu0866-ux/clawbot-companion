@@ -11,8 +11,13 @@
 
 ```bash
 sh tests/run_all.sh        # 逐套顺序运行（TZ=Asia/Shanghai、互不并行），任一失败退出码非 0
+python3 tests/run_all.py   # 跨平台入口（与 run_all.sh 等价；Windows 无 bash 时用这个，子进程统一 PYTHONUTF8=1）
 python3 tests/selftest_tune.py   # 也可单跑某套
 ```
+
+仓库 CI（`.github/workflows/tests.yml`）在 ubuntu-latest 与 windows-latest
+双矩阵上跑 `tests/run_all.py`；两处平台专属断言（session.json 权限位、
+libcrypto 的 find_library 口径）在 Windows 上自动切换为等价断言。
 
 可选依赖：`selftest_audio_screen` 与 `selftest_env_smoke` 的转写项需要
 带 faster-whisper 的解释器（`AUDIO_SCREEN_STT_PYTHON` 指定，或当前

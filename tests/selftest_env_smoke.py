@@ -73,7 +73,10 @@ def discover_stt_python():
     home = os.path.expanduser("~")
     for pat in (os.path.join(home, "*venv*", "bin", "python"),
                 os.path.join(home, ".venvs", "*", "bin", "python"),
-                os.path.join(home, "workspace", "*venv*", "bin", "python")):
+                os.path.join(home, "workspace", "*venv*", "bin", "python"),
+                os.path.join(home, "*venv*", "Scripts", "python.exe"),
+                os.path.join(home, ".venvs", "*", "Scripts", "python.exe"),
+                os.path.join(home, "workspace", "*venv*", "Scripts", "python.exe")):
         cands.extend(sorted(glob.glob(pat)))
     for c in cands:
         if not c or not os.path.exists(c):
@@ -178,7 +181,17 @@ def main():
     # ---- E4: bridge ctypes EVP（AES-128-ECB） ----
     import ctypes.util
     libname = ctypes.util.find_library("crypto")
-    check("E4a find_library('crypto') 命中", bool(libname), f"{libname!r}")
+    if os.name == "nt":
+        # Windows 的 find_library("crypto") 口径不可靠：改断言 bridge 的
+        # 候选加载（含 CPython 自带 libcrypto-3.dll）确实能加载成功
+        try:
+            _lib_ok = bridge is not None and bridge._libcrypto() is not None
+        except Exception:
+            _lib_ok = False
+        check("E4a libcrypto 可加载（Windows 候选路径）", _lib_ok,
+              f"find_library={libname!r}")
+    else:
+        check("E4a find_library('crypto') 命中", bool(libname), f"{libname!r}")
     if bridge is not None:
         key = bytes(range(16))
         data = "env smoke 明文 roundtrip ✓".encode("utf-8") + b"\x00\xff" * 4

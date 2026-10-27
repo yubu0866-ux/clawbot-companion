@@ -2,6 +2,21 @@
 
 本项目所有值得注意的变更都记录在这里。格式参考 Keep a Changelog，按日期倒序排列（最新在最上方）。维护约定：后续每次更新都在本文件顶部新增一段，与代码变更同一提交进仓。
 
+## 2026-10-27 — Windows 支持
+
+### Added
+
+- **Windows 部署路径**：新增 `start.bat` / `start.ps1`（与 `start.sh` 对齐：加载 `.env`、TZ、`PYTHONUTF8=1` 后拉起 serve）；新增 `docs/windows.md`（Python 与依赖、扫码登录、任务计划程序开机自启、NSSM/WinSW 注册服务、编码注意事项、与 Linux 的平台差异）；新增 `requirements.txt`（含仅 Windows 安装的 `tzdata` 标记依赖——Windows 无系统时区数据库，`zoneinfo` 依赖它）。
+- **跨平台测试入口与 CI**：新增 `tests/run_all.py`（与 `run_all.sh` 等价，Windows 无 bash 也能跑全套，子进程统一注入 `PYTHONUTF8=1`）；新增 `.github/workflows/tests.yml`，在 ubuntu-latest 与 windows-latest 双矩阵上跑全套自检，仓库 Actions 页可直接看 Windows 实测结果。
+
+### Changed
+
+- **文件锁跨平台**：`bridge.py` / `worker.py` / `proactive.py` / `tune.py` 的跨进程锁由直接调 `fcntl.flock` 改为可移植 shim（POSIX 仍走 flock，Windows 走 `msvcrt.locking` 字节范围锁），Linux 行为不变。
+- **进程内 AES 的 libcrypto 加载**：Windows 下候选 CPython 自带 `DLLs\libcrypto-3.dll`、conda `Library\bin` 与 PATH 裸名（此前 fallback 只有 Linux 的 `.so` 名，Windows 必然加载失败）；Linux 候选与顺序不变。
+- `bridge.py` 原子写的目录 fsync 改为仅 POSIX 执行（Windows 无 `O_DIRECTORY` 概念）；`logout` 的 systemctl 停服仅在 Linux 且存在 systemctl 时尝试（unit 名对齐本仓库 `clawbot-companion.service`），Windows 走 pid 路径。
+- 音频脚本（`scripts/audio_screen.py` / `audio_repair.py`）子进程输出解码固定 UTF-8，避免 Windows 区域编码下 ffmpeg 输出乱码/抛错。
+- 测试适配：faster-whisper 解释器发现新增 Windows venv 布局（`Scripts\python.exe`）；两处平台专属断言按平台分流（session.json 权限位断言仅 POSIX 生效；env_smoke 的 libcrypto 断言在 Windows 改为候选加载口径），断言总数与语义不变。
+
 ## 2026-10-27 — 像真人：撤上限与未回复情绪模型
 
 ### Added

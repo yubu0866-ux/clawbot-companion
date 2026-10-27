@@ -45,8 +45,12 @@ state/（本地状态：会话、历史、计数、每日简报；只存本机�
    ```
    按 `docs/configuration.md` 填写；API 密钥不要写进任何 JSON，只设置环境变量（变量名由 `llm.api_key_env` 指定，例如 `export COMPANION_LLM_API_KEY=...`，也可放进本地 `.env`）。
 3. **扫码登录**：运行登录命令后用微信扫码（具体命令见随附代码说明）；登录会话保存在本地 `state/`，不要分享、不要提交。
-4. **启动**：`./start.sh`（或参考 `clawbot-companion.service` 用 systemd 托管，先按文件内注释改占位路径与用户）。
+4. **启动**：`./start.sh`（或参考 `clawbot-companion.service` 用 systemd 托管，先按文件内注释改占位路径与用户）。Windows 用 `start.bat` / `start.ps1`，效果等价。
 5. **测试**：用你自己的微信给机器人发一条消息，确认能收到符合人设的回复；再检查主动消息开关（默认示例开启，可先关掉 `proactive.enabled` 观察几天）。
+
+### Windows
+
+平台支持：**Linux 与 Windows 均可完整部署运行**（Python 3.10+，推荐 3.12）。Windows 路径与 Linux 的差异只有三处：依赖多装一个 `tzdata`（已写进 `requirements.txt` 并限定仅 Windows 安装）、启动脚本换 `start.bat` / `start.ps1`、常驻方式换任务计划程序或 NSSM/WinSW 服务。完整步骤（扫码登录、计划任务开机自启、服务注册、编码注意事项）见 `docs/windows.md`。
 
 ## 功能清单
 
@@ -59,6 +63,7 @@ state/（本地状态：会话、历史、计数、每日简报；只存本机�
 - 风格调节（tune）：多个说话方式旋钮，可随反馈缓慢学习（可关闭）
 - 可选媒体与配音接口：默认关闭，接入点见 `docs/media-and-tts.md`
 - 本地状态与备份友好：状态集中在 `state/`，便于迁移与清理
+- 跨平台部署：Linux（systemd）与 Windows（任务计划 / 服务）均可运行，自检套件在双平台 CI 持续验证
 
 ## 配置说明摘要
 
