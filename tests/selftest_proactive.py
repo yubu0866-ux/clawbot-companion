@@ -122,8 +122,8 @@ def main():
     # 3. 静默时段
     home, m = make_home(ts(2026, 10, 21, 3, 0))
     check("3 凌晨 3 点静默时段不发", not m.decide(now=ts(2026, 10, 21, 3, 0)).get("due"))
-    # 4. 未回复并存上限（2026-10-22 放开到 3 条）：已有 3 条没被回复 → 不发
-    #     （把沙箱 daily_max 抬到 10，让滚动上限门控不先触发，单独验这道闸）
+    # 4. 未回复并存不再是闸（2026-10-27 情绪模型定版，旧并存上限已删）：
+    #     已有 3 条没被回复 → 照常按时段触发，未回复只进 mood 记账
     home, m = make_home(t0830, extra_state={
         "log": [{"ts": t0830 - 1800, "intent": "morning", "replied": None},
                 {"ts": t0830 - 3600, "intent": "lunch", "replied": None},
@@ -133,15 +133,19 @@ def main():
     _cfg["proactive"]["daily_max"] = 10
     json.dump(_cfg, open(_cfgp, "w"), ensure_ascii=False)
     d = m.decide(now=t0830)
-    check("4 已有三条主动没被回复 → 不发", not d.get("due") and "没被回复" in d.get("reason", ""),
-          str(d)[:80])
-    # 4b. 两条全是作废（没送达）→ 不算未回复，不被这道门控堵住
-    #     （2026-10-22 真实事故：晚安+早安两条作废堵死午饭档）
+    check("4 三条未回复并存 → 不再拦截，照常 due",
+          d.get("due") and d.get("intent") == "morning", str(d)[:80])
+    # 4b. 两条全是作废（没送达）→ 不算未回复、不进 streak，照常触发
+    #     （2026-10-22 真实事故：晚安+早安两条作废堵死午饭档；新口径下
+    #     作废条目连情绪记账都不参与）
     home, m = make_home(t0830, extra_state={
         "log": [{"ts": t0830 - 3600, "intent": "goodnight", "replied": None, "voided": True},
                 {"ts": t0830 - 7200, "intent": "morning", "replied": None, "voided": True}]})
     d = m.decide(now=t0830)
-    check("4b 两条作废不算未回复 → 不被两条门控堵", "两条" not in d.get("reason", ""),
+    st4b = json.load(open(os.path.join(home, "state", "proactive.json"),
+                          encoding="utf-8"))
+    check("4b 两条作废不算未回复 → 照常 due 且 streak=0",
+          d.get("due") and (st4b.get("mood") or {}).get("streak", 0) == 0,
           str(d)[:80])
     # 5. 观察期上限（started_on=今天 → 基线 4 条，滚动 24 小时已发 4 条）
     today = "2026-10-21"
@@ -259,14 +263,19 @@ def main():
     check("17 回应率再高上限也只到 3，第 3 条可发",
           cap == 3 and d.get("due") and d.get("intent") == "morning",
           f"cap={cap} d={str(d)[:80]}")
-    # 18. 连续被晾 → 冷却拦截
+    # 18. 连续被晾 → 不再冷却拦截（2026-10-27 撤除冷却）：只记 streak=2
+    #     进情绪模型，decide 的任何结果里都不许再出现「冷却」拦截
     log_miss = [{"ts": t0830 - 40 * 3600, "intent": "morning", "replied": True},
                 {"ts": t0830 - 30 * 3600, "intent": "lunch", "replied": False},
                 {"ts": t0830 - 13 * 3600, "intent": "evening", "replied": False}]
     home, m = make_home(t0830, extra_state={"log": log_miss})
     d = m.decide(now=t0830)
-    check("18 连续两条被晾 → 冷却中不发",
-          not d.get("due") and "冷却" in d.get("reason", ""), str(d)[:80])
+    st18 = json.load(open(os.path.join(home, "state", "proactive.json"),
+                          encoding="utf-8"))
+    check("18 连续两条被晾 → 无冷却拦截、streak 记为 2",
+          "冷却" not in d.get("reason", "")
+          and (st18.get("mood") or {}).get("streak") == 2,
+          str(d)[:80])
     # 19. 回应结算：主动发出后他回了消息 → 台账标 replied=True
     home, m = make_home(t0830, ctx_age_h=2,
                         extra_state={"log": [{"ts": t0830 - 3 * 3600,
@@ -337,14 +346,16 @@ def main():
     check("24 他一贯秒回 → 间隔仍在定版 0.4-1.0 小时内", 0.39 < delta_h < 1.01,
           f"delta={delta_h:.2f}h")
 
-    # ---- 节奏优化四轮 ----
-    # 25. followup 优先于条数上限：24h 已发满 3 条，到期话题照样能发
+    # ---- 节奏优化四轮（25 于 2026-10-27 改新口径） ----
+    # 25. followup 与上限的豁免耦合已撤：24h 已发满 3 条（daily_max 填
+    #     数字时），到期话题同样被上限拦下；followup 只保留「惦记未完
+    #     话题」的触发语义本身（默认无上限时照常优先触发，见用例 1）
     home, m = make_home(t0830, extra_state={"date": today, "sent_count": 0, "log": log3},
                         followups=[{"about": "他的面试", "after_ts": t0830 - 60,
                                     "created": t0830 - 86400}])
     d = m.decide(now=t0830)
-    check("25 到期 followup 不被条数上限误伤",
-          d.get("due") and d.get("intent") == "followup", str(d)[:80])
+    check("25 到期 followup 不再豁免条数上限（已满照拦）",
+          not d.get("due") and "滚动" in d.get("reason", ""), str(d)[:80])
     # 26. 形式裁定：photo 权重独占（photo_p=1、video_p=0）时闲聊类主动
     # 变照片形式；两权重同为 0 时回落纯文字
     # （photo_self_p 钉 0，本条专验旧主体奇偶轮换；自拍主体见 66）
@@ -891,13 +902,13 @@ def main():
     d = m.decide(now=t1500)
     check("60c P2 第二次命中 roll 被空耗 → 自愈重 roll",
           d.get("due") and d.get("intent") == "silence", str(d)[:100])
-    # 61. 用例 (e)：P1/P2 没动全域门控——条件再齐备，未回复并存达
-    # 上限 / 未回复计数达停线 / 静默时段，impulse 与 silence 照样被拦。
+    # 61. 用例 (e) 新口径（2026-10-27）：未回复并存与未回复计数都不再
+    # 是全域门控——impulse 在两类场景下照常触发；静默时段照旧生效。
     # 61a 未回复并存 3 条（三条都发在他最新消息之后，不会被结算掉）
     home, m = make_home(t1500, slots={}, ctx_age_h=50 / 60,
                         rhythm={"impulse_p": 1.0, "impulse_daily_max": 8},
                         extra_state={
-                            "last_sent_at": t1500 - 1000,
+                            "last_sent_at": t1500 - 4000,
                             "next_allowed_at": t1500 - 60,
                             "log": [{"ts": t1500 - 2000, "intent": "impulse",
                                      "replied": None},
@@ -910,9 +921,8 @@ def main():
     _cfg["proactive"]["daily_max"] = 10
     json.dump(_cfg, open(_cfgp, "w"), ensure_ascii=False)
     d = m.decide(now=t1500)
-    ok61a = not d.get("due") and "没被回复" in d.get("reason", "")
-    # 61b 未回复计数达停线（沙箱 decide 的停线缺省 5，计数给 8；
-    # 场景与 57 相同——P1 放行的话题门控之后，这道全域门控照样拦）
+    ok61a = d.get("due") and d.get("intent") == "impulse"
+    # 61b 未回复计数给 8：counters 自此不被决策层读取，照常触发
     home, m = make_home(t1500, slots={}, ctx_age_h=50 / 60,
                         rhythm={"impulse_p": 1.0, "impulse_daily_max": 8},
                         extra_state={"last_sent_at": t1500 - 4000,
@@ -921,13 +931,13 @@ def main():
               encoding="utf-8") as f:
         json.dump({"unreplied": 8}, f)
     d = m.decide(now=t1500)
-    ok61b = not d.get("due") and "没回" in d.get("reason", "")
+    ok61b = d.get("due") and d.get("intent") == "impulse"
     # 61c 静默时段对 silence 照旧生效
     home, m = make_home(ts(2026, 10, 21, 3, 0), slots={}, ctx_age_h=6)
     m.SILENCE_P = 1.0
     d = m.decide(now=ts(2026, 10, 21, 3, 0))
     ok61c = not d.get("due") and "静默时段" in d.get("reason", "")
-    check("61 P1/P2 后全域门控照旧（并存上限/全停线/静默时段）",
+    check("61 未回复不再是全域门控（并存/计数不停发、静默照旧）",
           bool(ok61a and ok61b and ok61c),
           f"unresolved={ok61a} stop={ok61b} quiet={ok61c}")
 
@@ -1255,7 +1265,7 @@ def main():
           and d.get("about") == ev["text"]
           and (d.get("brief") or {}).get("trigger", {}).get("type") == "life_event",
           str(d)[:200])
-    # 94. 有机模式安全闸全保留：静默时段 / context 太旧 / 未回熔断
+    # 94. 有机模式安全闸：静默时段 / context 太旧仍在；未回不再熔断
     home, m = make_home(ts(2026, 10, 21, 3, 0), mode="organic",
                         persona=ORGAN_PERSONA, organic={"spontaneous_p": 0.0})
     check("94a 有机模式凌晨静默硬闸（rare 默认关）",
@@ -1268,8 +1278,10 @@ def main():
                         organic={"spontaneous_p": 0.0})
     with open(os.path.join(home, "state", "counters.json"), "w", encoding="utf-8") as f:
         json.dump({"unreplied": 5}, f)
-    check("94c 有机模式连续未回熔断不发",
-          not m.decide(now=t0830).get("due"))
+    d = m.decide(now=t0830)
+    check("94c 有机模式未回复计数不再熔断（counters 不被决策层读取）",
+          "没回" not in d.get("reason", "") and "熔断" not in d.get("reason", ""),
+          str(d)[:80])
     # 95. 有机间隔采样：mark_sent 后 next_allowed_at 落在采样区间内，
     #     且间隔未到时 decide 不发
     home, m = make_home(time.time(), mode="organic", persona=ORGAN_PERSONA,
@@ -1297,6 +1309,112 @@ def main():
     home, m = make_home(t0830)
     pcfg97 = json.load(open(os.path.join(home, "config.json")))["proactive"]
     check("97 缺省 fixed 模式判定", m.proactive_mode(pcfg97) == "fixed")
+
+    # ---- 2026-10-27 撤上限 + 未回复情绪模型 ----
+    # 98. daily_max=null → 无上限：24h 内已发 20 条（全已回复）也不拦
+    home, m = make_home(t0830, extra_state={
+        "log": [{"ts": t0830 - (i + 1) * 900, "intent": "morning",
+                 "replied": True} for i in range(20)]})
+    _cfgp = os.path.join(home, "config.json")
+    _cfg = json.load(open(_cfgp))
+    _cfg["proactive"]["daily_max"] = None
+    json.dump(_cfg, open(_cfgp, "w"), ensure_ascii=False)
+    cap98 = m.effective_cap(m.load_state(), m.cfg()["proactive"], "2026-10-21")
+    d = m.decide(now=t0830)
+    check("98 daily_max=null 时无上限拦截（24h 20 条照发）",
+          cap98 is None and d.get("due") and d.get("intent") == "morning",
+          f"cap={cap98} d={str(d)[:80]}")
+    # 99. mood streak 累积与「他一回复清零」（mood_state 直测）
+    home, m = make_home(t0830)
+    st99 = m.load_state()
+    st99["log"] = [{"ts": t0830 - 30 * 3600, "intent": "morning", "replied": False},
+                   {"ts": t0830 - 26 * 3600, "intent": "lunch", "replied": False},
+                   {"ts": t0830 - 13 * 3600, "intent": "evening", "replied": False}]
+    mo99 = m.mood_state(st99, "2026-10-21")
+    ok99a = (mo99["streak"] == 3 and 0.60 < mo99["factor"] < 0.63
+             and bool(mo99["label"]))
+    st99["log"].append({"ts": t0830 - 3600, "intent": "impulse", "replied": True})
+    mo99b = m.mood_state(st99, "2026-10-21")
+    check("99 streak 累积 3 条、他一回复清零",
+          ok99a and mo99b["streak"] == 0 and mo99b["factor"] == 1.0,
+          f"a={mo99} b={mo99b}")
+    # 100. 跨日 streak 先减半（昨日 5 条 → 今日 2 条，无新结算）
+    st100 = m.load_state()
+    st100["log"] = [{"ts": t0830 - 50 * 3600, "intent": "morning", "replied": False}]
+    st100["mood"] = {"streak": 5, "date": "2026-10-20",
+                     "seen_ts": t0830 - 40 * 3600}
+    mo100 = m.mood_state(st100, "2026-10-21")
+    check("100 跨日 streak 减半（5 → 2）", mo100["streak"] == 2, str(mo100))
+    # 101. 有机间隔按待回复条数拉长：2 条待回复 → 采样间隔 ×2
+    tnow = time.time()
+    home, m = make_home(tnow, mode="organic", persona=ORGAN_PERSONA,
+                        organic={"spontaneous_p": 0.0},
+                        extra_state={"log": [
+                            {"ts": tnow - 3600, "intent": "impulse", "replied": False},
+                            {"ts": tnow - 1800, "intent": "impulse", "replied": False}]})
+    st101 = m.mark_sent("impulse")
+    gap101 = (float(st101["next_allowed_at"]) - float(st101["last_sent_at"])) / 3600
+    check("101 两条待回复 → 有机间隔下限翻倍（≥0.6h）",
+          0.599 <= gap101 <= 10.01, f"gap={gap101:.2f}h")
+    # 102. 轻触：streak ≥ 4 + 静默远超静默阈值（无常回样本兜底）+
+    #      light_touch_p=1 → 触发轻触（内容/时机断言 trigger 类型）
+    t1500b = ts(2026, 10, 21, 15, 0)
+    home, m = make_home(t1500b, mode="organic", persona=ORGAN_PERSONA,
+                        ctx_age_h=20,
+                        organic={"spontaneous_p": 0.0, "light_touch_p": 1.0},
+                        extra_state={"log": [
+                            {"ts": t1500b - k * 3600, "intent": "impulse",
+                             "replied": False} for k in (50, 44, 38, 32, 26)]})
+    plan102 = m._life.ensure_today(t1500b)
+    st102 = json.load(open(os.path.join(home, "state", "proactive.json")))
+    st102["organic"] = {"date": "2026-10-21",
+                        "fired": [x["id"] for x in plan102["moments"]]
+                                 + [e["id"] for e in plan102["events"]],
+                        "silence_date": "2026-10-21"}
+    json.dump(st102, open(os.path.join(home, "state", "proactive.json"), "w"),
+              ensure_ascii=False)
+    d = m.decide(now=t1500b)
+    check("102 被晾 5 条且远超回复间隔 → 轻触触发",
+          d.get("due") and d.get("intent") == "impulse"
+          and (d.get("brief") or {}).get("trigger", {}).get("type") == "light_touch",
+          str(d)[:160])
+    # 103. 锚点犹豫：streak=2 时锚点首次到点先推迟半小时，之后照常发
+    home, m = make_home(t0830, mode="organic", persona=ORGAN_PERSONA,
+                        organic={"spontaneous_p": 0.0, "wakeup_skip_p": 0.0},
+                        extra_state={"log": [
+                            {"ts": t0830 - 26 * 3600, "intent": "morning", "replied": False},
+                            {"ts": t0830 - 25 * 3600, "intent": "lunch", "replied": False}]})
+    plan103 = m._life.ensure_today(t0830)
+    wake103 = next(x for x in plan103["moments"] if x["kind"] == "wakeup")
+    st103 = json.load(open(os.path.join(home, "state", "proactive.json")))
+    st103["organic"] = {"date": "2026-10-21",
+                        "fired": [e["id"] for e in plan103["events"]],
+                        "silence_date": "2026-10-21"}
+    json.dump(st103, open(os.path.join(home, "state", "proactive.json"), "w"),
+              ensure_ascii=False)
+    with open(os.path.join(home, "state", "context.json"), "w", encoding="utf-8") as f:
+        json.dump({"context_token": "tok-test",
+                   "received_at": float(wake103["ts"]) - 2 * 3600,
+                   "stale": False}, f)
+    t_hit = max(float(wake103["ts"]) + 300, ts(2026, 10, 21, 7, 5))
+    d1 = m.decide(now=t_hit)
+    st103b = json.load(open(os.path.join(home, "state", "proactive.json")))
+    held103 = ((st103b.get("organic") or {}).get("held") or {})
+    d2 = m.decide(now=t_hit + 31 * 60)
+    check("103 streak=2 锚点犹豫：首次推迟、半小时后照常发",
+          (not d1.get("due")) and wake103["id"] in held103
+          and d2.get("due") and d2.get("intent") == "morning",
+          f"d1={str(d1)[:80]} held={held103} d2={str(d2)[:80]}")
+    # 104. daily_max 填数字时对 followup 不再豁免：已满 3 条 → followup 也拦
+    home, m = make_home(t0830, followups=[{"about": "他的面试", "after_ts": t0830 - 60,
+                                           "created": t0830 - 86400}],
+                        extra_state={"log": [
+                            {"ts": t0830 - 3 * 3600, "intent": "morning", "replied": True},
+                            {"ts": t0830 - 2 * 3600, "intent": "lunch", "replied": True},
+                            {"ts": t0830 - 3600, "intent": "impulse", "replied": True}]})
+    d = m.decide(now=t0830)
+    check("104 上限填数字已满时 followup 同样被拦（无豁免）",
+          not d.get("due") and "滚动" in d.get("reason", ""), str(d)[:80])
 
     passed = sum(1 for _, ok in RESULTS if ok)
     print(f"\n==== proactive selftest: {passed}/{len(RESULTS)} PASS ====")

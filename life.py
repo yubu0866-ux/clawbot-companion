@@ -41,6 +41,7 @@ FACTS_FILE = os.path.join(HOME, "facts.json")
 HISTORY_FILE = os.path.join(STATE, "history.jsonl")
 LIFE_TODAY_FILE = os.path.join(STATE, "life_today.json")
 OWNER_PROFILE_FILE = os.path.join(STATE, "owner_profile.json")
+LIFE_HISTORY_FILE = os.path.join(STATE, "life_history.json")
 
 # 无人设 routine 时的中性兜底作息（与示例人设的「7 点半起、23 点睡」一致）
 DEFAULT_ROUTINE = {
@@ -297,6 +298,20 @@ def owner_summary(now=None):
 
 # ---------------- 每日生活状态 ----------------
 
+_EXCITING_KEYS = ("约", "成功", "点头", "更新", "买", "囤", "来玩",
+                  "中奖", "升职", "通过", "见面", "旅行")
+
+
+def _excitement(kind, text):
+    """事件兴奋度 0–1：圈子事底子最高、习惯事最低，含兴奋关键词
+    （约/成功/更新/买…）再加成。proactive 的情绪模型用它判「兴奋
+    事件」：被晾时不犹豫，分享出去后还能冲淡未回复 streak。"""
+    base = {"circle": 0.6, "habit": 0.35, "daily": 0.55}.get(kind, 0.5)
+    if any(k in str(text) for k in _EXCITING_KEYS):
+        base += 0.25
+    return round(min(1.0, base), 2)
+
+
 def _event_pool(life):
     """事件池：circle 成员的日常（带人物与时段窗）+ habits 仪式 + 通用池
     + facts.life 的 small_events / occasional_events。每项
@@ -321,7 +336,8 @@ def _event_pool(life):
             else:
                 win = (600, 1260)
             pool.append({"text": text, "kind": "circle", "who": who,
-                         "window": win})
+                         "window": win,
+                         "excitement": _excitement("circle", text)})
     for habit in life.get("habits") or []:
         if not isinstance(habit, dict):
             continue
@@ -332,16 +348,19 @@ def _event_pool(life):
         win = {"morning": (390, 600), "noon": (660, 840),
                "evening": (1080, 1320)}.get(hint, (540, 1320))
         pool.append({"text": text, "kind": "habit",
-                     "who": str(habit.get("label") or ""), "window": win})
+                     "who": str(habit.get("label") or ""), "window": win,
+                     "excitement": _excitement("habit", text)})
     for text in GENERIC_EVENTS:
         pool.append({"text": text, "kind": "daily", "who": "",
-                     "window": (570, 1290)})
+                     "window": (570, 1290),
+                     "excitement": _excitement("daily", text)})
     for key in ("small_events", "occasional_events"):
         for text in life.get(key) or []:
             text = str(text).strip()
             if text:
                 pool.append({"text": text, "kind": "daily", "who": "",
-                             "window": (540, 1290)})
+                             "window": (540, 1290),
+                             "excitement": _excitement("daily", text)})
     return pool
 
 
@@ -360,6 +379,34 @@ def _snap_to_active(minutes, active_hours):
                                           or abs(cand - minutes) < abs(best - minutes)):
             best = cand
     return best if best is not None else minutes
+
+
+# ---------------- 跨日延续（心情 / 事件去重 / 作息漂移） ----------------
+
+def _load_life_history():
+    hist = read_json(LIFE_HISTORY_FILE, {}) or {}
+    if not isinstance(hist.get("days"), dict):
+        hist["days"] = {}
+    if not isinstance(hist.get("walk"), dict):
+        hist["walk"] = {}
+    return hist
+
+
+def _save_life_history(hist, keep_days=10):
+    days = hist.get("days") or {}
+    for key in sorted(days)[:-keep_days]:
+        days.pop(key, None)
+    hist["days"] = days
+    write_json(LIFE_HISTORY_FILE, hist)
+
+
+def _prev_day_entry(hist, date_str):
+    """最近一个早于 date_str 的历史日（心情延续的数据源）。"""
+    prev = [d for d in (hist.get("days") or {}) if d < date_str]
+    if not prev:
+        return None, None
+    d = max(prev)
+    return d, hist["days"][d]
 
 
 def generate_today(now=None):
@@ -388,6 +435,29 @@ def generate_today(now=None):
     rt = routine_for("restday" if day_kind == "rest" else "workday", life)
     wake = _hhmm_to_min(rt.get("wake"), 450)
     sleep = _hhmm_to_min(rt.get("sleep"), 1380)
+    # 跨日延续一：作息随机游走。今天的起床/入睡基准从上一个同类日
+    # （工作日/休息日分开记）的基准小步漂移（σ=organic.
+    # anchor_walk_step_min，默认 8 分钟），幅度封在 routine 的
+    # wake [-45,+60] / sleep [-45,+45] 分钟内——像真人作息会慢慢漂，
+    # 不会一夜跳变。同一天重复生成直接复用已记录的基准（确定性）。
+    hist = _load_life_history()
+    walk = hist.setdefault("walk", {})
+    wstate = walk.get(day_kind) or {}
+    step = _f(oc.get("anchor_walk_step_min"), 8.0)
+    # 两个高斯抽样无条件先抽：保证同一天重复生成的 rng 序列完全一致
+    # （每日计划确定性），复用分支不许少抽。
+    g_wake = rng.gauss(0, step)
+    g_sleep = rng.gauss(0, step)
+    if wstate.get("date") == date_str and wstate.get("wake") is not None:
+        wake = int(wstate["wake"])
+        sleep = int(wstate["sleep"])
+    else:
+        if wstate.get("wake") is not None:
+            wake = int(max(wake - 45, min(wake + 60,
+                         int(wstate["wake"] + g_wake))))
+            sleep = int(max(sleep - 45, min(sleep + 45,
+                          int(wstate["sleep"] + g_sleep))))
+        walk[day_kind] = {"date": date_str, "wake": wake, "sleep": sleep}
     day0 = datetime(local.year, local.month, local.day,
                     tzinfo=tz()).timestamp()
 
@@ -458,20 +528,42 @@ def generate_today(now=None):
     moods = life.get("moods") or {}
     mood_pool = moods.get(busy) or DEFAULT_MOODS.get(busy) or ["平静"]
     mood = rng.choice([str(m) for m in mood_pool]) if mood_pool else "平静"
+    # 跨日延续二：心情延续。昨天的基调以 organic.mood_carry_p（默认
+    # 0.4）的概率原样带到今天——睡一觉不一定全好，也不会每天换一张脸。
+    prev_date, prev_entry = _prev_day_entry(hist, date_str)
+    mood_carry = ""
+    if prev_entry and prev_entry.get("mood") \
+            and rng.random() < _f(oc.get("mood_carry_p"), 0.4):
+        mood = str(prev_entry["mood"])
+        mood_carry = prev_date
 
     # 生活事件：池中不重复抽 1-3 件，各配分享时刻（事件时段窗内采样，再
-    # 向主人活跃时段轻微吸附）与权重
+    # 向主人活跃时段轻微吸附）与权重。
+    # 跨日延续三：事件防重复——近 organic.event_dedupe_days 天（默认
+    # 3 天）已采样过的事件文本先排除；排除后不够抽再回退全池（池太小
+    # 的人设不至于没事可发）。
     pool = _event_pool(life)
+    dedupe_days = int(_f(oc.get("event_dedupe_days"), 3))
+    recent_texts = set()
+    if dedupe_days > 0:
+        cutoff = (local.date() - timedelta(days=dedupe_days)).isoformat()
+        for dstr, entry in (hist.get("days") or {}).items():
+            if cutoff <= dstr < date_str:
+                recent_texts.update(entry.get("events") or [])
+    fresh = [e for e in pool if e["text"] not in recent_texts]
     rng.shuffle(pool)
+    rng.shuffle(fresh)
     n_events = rng.choices([1, 2, 3], weights=[0.3, 0.45, 0.25])[0]
+    chosen = fresh if len(fresh) >= n_events else pool
     active_hours = prof.get("active_hours") or []
     events = []
-    for i, ev in enumerate(pool[:n_events]):
+    for i, ev in enumerate(chosen[:n_events]):
         lo, hi = ev["window"]
         share_min = rng.uniform(lo, max(lo + 30, hi - 30))
         share_min = _snap_to_active(share_min, active_hours)
         events.append({"id": f"{date_str}:evt{i}", "text": ev["text"],
                        "kind": ev["kind"], "who": ev["who"],
+                       "excitement": ev.get("excitement", 0.5),
                        "share_at": ts_of(share_min),
                        "time": _min_to_hhmm(share_min),
                        "weight": round(rng.uniform(0.5, 1.0), 2)})
@@ -484,12 +576,19 @@ def generate_today(now=None):
         thr_lo, thr_hi = 2.5, 6.0
     plan = {"date": date_str, "day_kind": day_kind, "generated_at": now,
             "schedule": blocks, "moments": moments, "events": events,
-            "mood": mood, "busy_level": busy,
+            "mood": mood, "busy_level": busy, "mood_carry": mood_carry,
             "silence_threshold_h": round(rng.uniform(thr_lo, thr_hi), 2),
             "owner_adapt": {"applied": bool(adapt_on and (wake_shift or sleep_shift)),
                             "wake_shift_min": int(round(wake_shift)),
-                            "sleep_shift_min": int(round(sleep_shift))}}
+                            "sleep_shift_min": int(round(sleep_shift)),
+                            "reply_delay_med_min": prof.get("reply_delay_med_min")}}
     write_json(LIFE_TODAY_FILE, plan)
+    # 今日摘要入跨日历史（心情/事件/游走基准），只留最近 10 天
+    days = hist.setdefault("days", {})
+    days[date_str] = {"mood": mood, "busy_level": busy,
+                      "day_kind": day_kind,
+                      "events": [e["text"] for e in events]}
+    _save_life_history(hist)
     return plan
 
 
@@ -526,6 +625,7 @@ def brief_summary(now=None):
     evs = plan.get("events") or []
     return {"date": plan.get("date"), "day_kind": plan.get("day_kind"),
             "mood": plan.get("mood"), "busy_level": plan.get("busy_level"),
+            "mood_carry": plan.get("mood_carry"),
             "now_block": current_block(plan, now),
             "next_moment": nxt,
             "events_shared_or_due": [e.get("text") for e in evs

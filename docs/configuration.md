@@ -34,13 +34,13 @@
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `proactive.enabled` | bool | 主动消息总开关 |
-| `proactive.daily_max` | number | 主动消息每日条数上限（观察期过后生效，见下两行） |
+| `proactive.daily_max` | number \| null | **可选项**：主动消息每日条数上限。`null` 或不填（默认）= **不设上限**，发送量由生活计划（锚点/事件本身有限）与间隔采样自然涌现；填数字才启用上限（观察期过后生效，见下行），且对所有意图（含 followup）一致生效 |
 | `proactive.observation_days` / `proactive.observation_cap` | number | 观察期：首次启动后前 N 天每日上限为 `min(observation_cap, daily_max)`；其间若已发的主动条条被回复则提前放开到 `daily_max` |
 | `proactive.quiet_hours` | [number, number] | 静默时段起止小时（本地时间），如 `[1, 7]` |
 | `proactive.min_gap_hours` | number | 两条主动消息最小间隔（小时）的兜底值；正常节拍由 `rhythm.gap_hours` 随机化决定，此键只在没有随机节拍记录时兜底 |
 | `proactive.max_context_age_hours` | number | 上下文超过该时长则不主动发消息（bridge 侧同读此键） |
 | `proactive.active_skip_min` | number | 用户最近 N 分钟内在聊天则跳过主动消息 |
-| `proactive.unresolved_max` / `proactive.unreplied_stop` | number | 未回复主动消息的并存上限 / 连续未回复多少条后停发 |
+| `proactive.unresolved_max` / `proactive.unreplied_stop` | number | **旧键，已失效**：2026-10-27 起未回复不再触发任何拦截（见下方「情绪模型」），这两个键不再被读取，老配置带着也无副作用，可自行删除 |
 | `proactive.slots.<name>.window` | [string, string] | 时段窗起止 `HH:MM`；`<name>` 为意图名：`morning` / `lunch` / `evening` / `goodnight` |
 | `proactive.slots.<name>.p` | number | 该时段触发概率 0–1（连败两天有保底必中、连中两天概率减半的修正由代码处理） |
 | `proactive.silence_hours` | number | **扁平键**：用户静默至少该时长后，长静默消息才可 roll（傍晚/周末白天改用 `rhythm.silence_evening_hours`） |
@@ -57,11 +57,11 @@
 | `rhythm.gap_hours` | [number, number] | 一条主动记账后，下一次可主动的随机间隔（小时）范围（默认 `[2.5, 4.5]`，示例给 `[0.4, 1.0]`） |
 | `rhythm.jitter_min` | [number, number] | 时段/静默类消息的发送抖动分钟范围（上限封顶 10） |
 | `rhythm.followup_expire_hours` | number | 约定跟进（followup）的过期时长，超过不再提（默认 48） |
-| `rhythm.reply_window_hours` / `rhythm.cooldown_hours` | number | 判定一条主动「被回复」的窗口 / 连续被晾后的冷却时长 |
+| `rhythm.reply_window_hours` / `rhythm.cooldown_hours` | number | 判定一条主动「被回复」的窗口 / 冷却时长（**已失效**：2026-10-27 起不再设冷却，键保留仅为兼容） |
 | `rhythm.silence_evening_hours` | number | 傍晚（17–22 点）与周末白天用的静默阈值（小时，默认 3） |
 | `rhythm.impulse_daily_max` / `rhythm.impulse_p` | number | 时段外随机主动（impulse）的每日条数上限（默认 1）与每轮触发概率（默认 0.03）。注意这两个键在 `rhythm` 里 |
 | `rhythm.double_p` | number | silence/evening/lunch 意图偶尔二连发的概率（默认 0.18） |
-| `rhythm.photo_p` / `rhythm.video_p` | number | 主动媒体形式裁定的相对权重：照片可达意图 morning/evening/silence，视频可达 evening/silence/impulse；同为可达时按权重二选一，两者都为 0 则纯文字（默认各 1.0）。分形式条数不单独设限，只受 `daily_max` 总量约束 |
+| `rhythm.photo_p` / `rhythm.video_p` | number | 主动媒体形式裁定的相对权重：照片可达意图 morning/evening/silence，视频可达 evening/silence/impulse；同为可达时按权重二选一，两者都为 0 则纯文字（默认各 1.0）。分形式条数不单独设限；总量默认不限，仅当 `daily_max` 填数字时受其约束 |
 | `rhythm.photo_self_p` / `rhythm.video_self_p` | number | 媒体主体抽中首项（本人出镜）的概率（默认 0.7） |
 
 ### 有机主动模式与生活系统（`proactive.mode` / `life.py`）
@@ -69,7 +69,9 @@
 `proactive.mode` 有两个取值：
 
 - `fixed`（缺省）：上文的固定时段窗 + 固定概率排班，行为与旧版一致。
-- `organic`：主动节奏不再排班，改为读 `life.py` 每天采样生成的**生活计划**行动。全部安全闸（`daily_max`、未回复并存/熔断、静默时段、context 新鲜度、冷却、观察期）在两种模式下完全一致、位置不变；followup（约定跟进）仍最高优先级。
+- `organic`：主动节奏不再排班，改为读 `life.py` 每天采样生成的**生活计划**行动。安全闸（静默时段、context 新鲜度、刚聊完避让）在两种模式下完全一致；`daily_max` 仅在填数字时作为总量上限存在（缺省不限）；followup（约定跟进）仍最高优先级。
+
+**情绪模型（未回复的新语义，两种模式通用）**：她发出的主动消息若一直没被回复，系统**不会**停发、不会冷却、不会设并存上限。连续未回复数（streak）只是一个调制信号：streak 每多一条，她发起一次主动的概率乘以 0.85（下限 0.3，永不归零）、下一次的发送间隔按待回复条数拉长（每条 ×1.5，封顶 ×3.5）、锚点与普通生活事件会先「犹豫」半小时或掷骰推迟；生成简报的 `life_state.mood_streak` 会带上当前 streak 与情绪标签，供生成层拿捏语气（放轻、别追问）。恢复通道同样像真人：他一回复 streak 立即清零；跨天先减半；她遇到兴奋的生活事件（excitement ≥ 0.75）分享出去后冲淡 1 条；streak ≥ 4 且超过他通常回复间隔 1.5 倍还没动静时，还有极低概率的「轻触」（`organic.light_touch_p`，默认 0.02/轮）轻轻碰一下。平台侧的物理限制（通道连续多条未回复会被限流、上下文过期发不出）由投递层的失败分类与退避处理，与决策层无关。
 
 有机模式的日常是这样运转的：
 
@@ -77,7 +79,8 @@
 2. **锚点时刻**：由角色作息骨架（见下 `routine`）推出起床后 / 午休 / 下班后（休息日为下午）/ 睡前四个锚点，各带 ±`anchor_jitter_min`（默认 45 分钟）随机抖动与当日跳过概率——不是每天每个点都会出声；错过追赶窗（`moment_catchup_min`，默认 120 分钟）的锚点直接作废，不补发迟到的问候。
 3. **生活事件驱动**：计划里的生活事件各有采样出的分享时刻，到点以 impulse 形式分享（每日上限 `event_daily_max`，默认 3），生成层拿到的是事件本身而不是时段标签；另有极低概率的自发分享（`spontaneous_p`，默认 0.02/轮）。
 4. **采样静默阈值与间隔**：长静默关怀的触发阈值按日在 `silence_threshold_h`（默认 [2.5, 6] 小时）内采样，当日只掷一次；两条主动之间的间隔在 [`gap_sample_min_h`, `gap_sample_max_h`]（默认 [0.3, 5] 小时）内做对数正态采样——多数一两小时，偶尔很快，偶尔大半天安静，没有固定节拍。
-5. **生成契约**：decide 返回的 brief 里带 `trigger`（触发缘由：plan / life_event / silence_care / spontaneous / quiet_rare）与 `life_state`（她当下的心情、日程块、忙碌度），文案据此生成，不再有模板化问候感。
+5. **生成契约**：decide 返回的 brief 里带 `trigger`（触发缘由：plan / life_event / silence_care / spontaneous / light_touch / quiet_rare）与 `life_state`（她当下的心情、日程块、忙碌度、未回复情绪 mood_streak、今日已发生事件 events_done、心情延续来源 mood_carry），文案据此生成，不再有模板化问候感。
+6. **跨日延续**：生活不是每天重置的——昨天的**心情基调**以 `mood_carry_p`（默认 0.4）概率带到今天；**生活事件**近 `event_dedupe_days` 天（默认 3 天）内不重复采样；她的**作息基准**（起床/入睡）会从昨天的基准小步随机漂移（σ=`anchor_walk_step_min`，默认 8 分钟，幅度有封顶），工作日与休息日分开漂。跨日状态只存本地 `state/life_history.json`（滚动 10 天）。
 
 `proactive.organic` 参数（全部可缺省，缺失走默认值）：
 
@@ -89,6 +92,10 @@
 | `organic.gap_sample_min_h` / `gap_sample_max_h` | number | 主动间隔对数正态采样的下/上界（小时，默认 0.3 / 5.0） |
 | `organic.silence_threshold_h` | [number, number] | 静默关怀阈值的按日采样区间（小时，默认 [2.5, 6.0]） |
 | `organic.spontaneous_p` | number | 自发小分享每轮触发概率（默认 0.02） |
+| `organic.light_touch_p` | number | 轻触每轮触发概率（默认 0.02；仅 streak ≥ 4 且超过他通常回复间隔 1.5 倍时才有机会掷） |
+| `organic.event_dedupe_days` | number | 生活事件防重复窗口（天，默认 3；0 = 不去重） |
+| `organic.mood_carry_p` | number | 昨日心情基调延续到今天的概率（默认 0.4） |
+| `organic.anchor_walk_step_min` | number | 作息基准每日随机漂移的 σ（分钟，默认 8） |
 | `organic.moment_catchup_min` | number | 锚点过时作废的追赶窗（分钟，默认 120） |
 | `organic.quiet_rare` | object | 静默时段的稀有例外，**默认关**：`{enabled: false, p: 0.05, max_per_week: 1}`。开启后仅 organic 模式下、深夜可能以低概率放行一条**纯文字**主动（滚动 7 天至多 `max_per_week` 次），其余全部门控照旧。不开启时静默时段就是硬闸 |
 

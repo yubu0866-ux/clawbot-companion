@@ -16,9 +16,12 @@ proactive.mode="organic" 时改走有机主动引擎：不再用固定时段窗�
 概率排班，而是读 life.py 每日按日期种子采样的生活计划
 （state/life_today.json）——锚点时刻（起床后/午休/下班后/睡前）自带
 随机抖动与当日跳过，她的生活事件到分享时刻触发 impulse，长静默关怀
-阈值按日采样，两次主动间隔对数正态采样。全部安全闸（每日上限、未回
-复并存/熔断、静默时段、context 新鲜度、冷却）与 fixed 模式共用、位置
-不变。mode 缺省或 life.py 不可用时回落 fixed（兼容旧行为）。
+阈值按日采样，两次主动间隔对数正态采样。安全闸（静默时段、context
+新鲜度、刚聊完避让）与 fixed 模式共用；每日总量上限仅在 config 的
+daily_max 填数字时存在（null/缺省 = 不限，2026-10-27 定版）。未回复
+自 2026-10-27 起不再是闸：连续未回复数（streak）只进情绪模型调制
+概率、间隔与简报（见 mood_state），没有并存拦截、熔断与冷却。
+mode 缺省或 life.py 不可用时回落 fixed（兼容旧行为）。
 
 CLI: tick [--now TS] / sent --intent X [--about T] [--event S] [--message-id M] / dry-run / status
 """
@@ -290,17 +293,22 @@ def _day_of(value):
 
 
 def daily_cap(st, pcfg, today):
-    """基线：上线头 observation_days 天为观察期，每天最多 observation_cap
-    条，之后用 config 的 daily_max。实际生效上限由 effective_cap 按
-    对方回应率在此基础上向下浮动。"""
+    """基线：daily_max 为 null/缺省时返回 None = 不设总量上限（2026-10-27
+    定版：发送量由生活计划的锚点/事件数量与间隔采样自然涌现，不再有
+    计数闸）；daily_max 填数字时旧口径全保留——上线头 observation_days
+    天为观察期、每天最多 observation_cap 条，之后用 daily_max。实际
+    生效上限由 effective_cap 按对方回应率在此基础上向下浮动。"""
+    dm = pcfg.get("daily_max")
+    if dm is None:
+        return None
     try:
         started = _day_of(st.get("started_on") or today)
         days = (_day_of(today) - started).days
     except ValueError:
         days = 99
     if days < int(pcfg.get("observation_days", 2)):
-        return min(int(pcfg.get("observation_cap", 4)), int(pcfg.get("daily_max", 3)))
-    return int(pcfg.get("daily_max", 3))
+        return min(int(pcfg.get("observation_cap", 4)), int(dm))
+    return int(dm)
 
 
 def reconcile_voided(st):
@@ -559,7 +567,9 @@ def used_events_today(st, today):
 
 def resolve_replies(st, now, ctx_received_at, window_h=12, cooldown_h=24):
     """结算台账里未定性的主动消息：他在此后发过消息 = 已回复；
-    超过 window_h 小时还没动静 = 被晾。连续两条被晾 → 进入 cooldown_h 小时冷却。"""
+    超过 window_h 小时还没动静 = 被晾。结算结果只喂回应率统计与情绪
+    模型（mood_state）；2026-10-27 起不再因连续被晾设冷却——
+    cooldown_h 参数保留仅为调用兼容，不再写 cooldown_until。"""
     changed = False
     for e in st.get("log", []):
         if e.get("voided"):
@@ -572,14 +582,6 @@ def resolve_replies(st, now, ctx_received_at, window_h=12, cooldown_h=24):
             elif now - float(e.get("ts", 0)) > window_h * 3600:
                 e["replied"] = False
                 changed = True
-    resolved = [e for e in st.get("log", []) if e.get("replied") is not None]
-    if len(resolved) >= 2 and resolved[-1].get("replied") is False \
-            and resolved[-2].get("replied") is False:
-        last_ts = float(resolved[-1].get("ts", now))
-        cd = last_ts + window_h * 3600 + cooldown_h * 3600
-        if float(st.get("cooldown_until", 0)) < cd:
-            st["cooldown_until"] = cd
-            changed = True
     return changed
 
 
@@ -594,6 +596,59 @@ def reply_stats(st):
             "median_latency": lats[len(lats) // 2] if lats else None}
 
 
+# ---------------- 情绪模型（2026-10-27 定版） ----------------
+# 未回复不再是任何一道闸：没有并存拦截、没有熔断、没有冷却。台账结算
+# 出的连续未回复数（streak）只作调制信号——她发起的概率按 factor
+# 衰减、发送间隔按 streak 拉长、生成简报带上情绪标签；他一回复 streak
+# 立即清零，跨日先减半（睡一觉气消了一半），兴奋的生活事件还能再冲淡。
+# factor 有下限（0.3），概率永不归零：代码里不存在因未回复停发的路径。
+MOOD_FACTOR_FLOOR = 0.3
+MOOD_FACTOR_BASE = 0.85
+
+
+def _mood_label(streak):
+    if streak <= 0:
+        return ""
+    if streak == 1:
+        return "有一点被晾着的小情绪"
+    if streak == 2:
+        return "连着两条没回，主动时语气放轻一点"
+    if streak <= 4:
+        return "被晾了几条了，主动时更小心翼翼，别追问"
+    return "好几条没回了，只轻轻碰一下，不连发不追问"
+
+
+def mood_state(st, today):
+    """情绪模型记账（st["mood"] = {streak, date, seen_ts}）：按台账顺序
+    消费新结算的条目——replied=True 清零、False 加一；未结算（None）
+    的条目挡住扫描（结算按时间成前缀，不会乱序计入）。跨日首次调用
+    先把 streak 减半。返回 {streak, factor, label}；本函数只改内存，
+    落盘由调用方负责（decide 的调用点已统一 save）。"""
+    mood = st.get("mood")
+    if not isinstance(mood, dict):
+        mood = {"streak": 0, "date": today, "seen_ts": 0.0}
+        st["mood"] = mood
+    if mood.get("date") != today:
+        mood["streak"] = int(mood.get("streak", 0) or 0) // 2
+        mood["date"] = today
+    seen = float(mood.get("seen_ts") or 0)
+    streak = int(mood.get("streak", 0) or 0)
+    for e in st.get("log", []):
+        ts = float(e.get("ts", 0) or 0)
+        if ts <= seen or e.get("voided"):
+            continue
+        r = e.get("replied")
+        if r is None:
+            break
+        streak = 0 if r else streak + 1
+        seen = ts
+    mood["streak"] = streak
+    mood["seen_ts"] = seen
+    return {"streak": streak,
+            "factor": max(MOOD_FACTOR_FLOOR, MOOD_FACTOR_BASE ** streak),
+            "label": _mood_label(streak)}
+
+
 def effective_cap(st, pcfg, today):
     """生效上限：基线（观察期 3 / 常规 daily_max）之内按回应率下调——
     样本 >=5：回应率 >=40% 用基线，20%-40% 降到 4，更低降到 2
@@ -601,6 +656,8 @@ def effective_cap(st, pcfg, today):
     回应好只体现在不降额、提前毕业与间隔收紧，不突破基线。
     观察期里若已有 >=3 条且条条被回复，提前放开到常规基线。"""
     base = daily_cap(st, pcfg, today)
+    if base is None:
+        return None  # 不设上限：没有基线可浮动
     stats = reply_stats(st)
     # 提前毕业必须先判：观察期内条条被回就放开到 daily_max；
     # 若先走下面 n>=5 的回应率分支，会直接返回观察期基线，把毕业挡死
@@ -698,7 +755,7 @@ def proactive_mode(pcfg=None):
     return "fixed"
 
 
-def _organic_pick(st, pcfg, now, local, ctx):
+def _organic_pick(st, pcfg, now, local, ctx, mood=None):
     """有机模式触发判定（只在全部安全闸已通过、且无到期 followup 时调用）。
 
     按今日生活计划（life.ensure_today）依次看：
@@ -715,6 +772,10 @@ def _organic_pick(st, pcfg, now, local, ctx):
     返回 {"intent","about","trigger"} 或 {"reason"}；命中/作废的锚点与
     事件记入 st["organic"]["fired"] 并落盘（decide 在锁内执行）。"""
     oc = pcfg.get("organic") or {}
+    if mood is None:
+        mood = {"streak": 0, "factor": 1.0, "label": ""}
+    streak = int(mood.get("streak", 0) or 0)
+    factor = float(mood.get("factor", 1.0) or 1.0)
     plan = _life.ensure_today(now)
     today = plan.get("date") or local.date().isoformat()
     org = st.get("organic")
@@ -723,9 +784,10 @@ def _organic_pick(st, pcfg, now, local, ctx):
         keep = (org or {}).get("quiet_rare_dates") or [] \
             if isinstance(org, dict) else []
         org = {"date": today, "fired": [], "silence_date": None,
-               "quiet_rare_dates": keep}
+               "quiet_rare_dates": keep, "held": {}}
         st["organic"] = org
     fired = org.setdefault("fired", [])
+    org.setdefault("held", {})
     changed = False
 
     def oc_f(key, default):
@@ -751,6 +813,17 @@ def _organic_pick(st, pcfg, now, local, ctx):
             continue
         if m.get("skip") or now < mts:
             continue
+        # 情绪调制（锚点犹豫）：被晾攒到 2 条以上，锚点先犹豫半小时
+        # 再发——只犹豫一次、且追赶窗还够时才犹豫，临近过窗照常发。
+        # 这是延迟不是拦截：她最后还是会出声。
+        held = org.setdefault("held", {})
+        if streak >= 2 and mid not in held \
+                and mts + catchup - now >= 40 * 60:
+            held[mid] = now + 30 * 60
+            changed = True
+            continue
+        if now < float(held.get(mid, 0) or 0):
+            continue
         fired.append(mid)
         changed = True
         if changed:
@@ -767,7 +840,19 @@ def _organic_pick(st, pcfg, now, local, ctx):
             if not eid or eid in fired:
                 continue
             if now >= float(e.get("share_at", 0) or 0):
+                exciting = float(e.get("excitement") or 0) >= 0.75
+                # 情绪调制（事件犹豫与冲淡）：普通事件在被晾时按
+                # factor 犹豫（不消耗，下个 tick 再掷）；兴奋事件
+                # （excitement 高）不犹豫，分享出去后 streak 冲淡 1。
+                if streak >= 2 and not exciting \
+                        and random.random() > factor:
+                    continue
                 fired.append(eid)
+                if exciting and streak > 0:
+                    mst = st.get("mood")
+                    if isinstance(mst, dict):
+                        mst["streak"] = max(
+                            0, int(mst.get("streak", 0) or 0) - 1)
                 save_state(st)
                 return {"intent": "impulse", "about": str(e.get("text") or ""),
                         "trigger": {"type": "life_event",
@@ -780,13 +865,35 @@ def _organic_pick(st, pcfg, now, local, ctx):
     if (org.get("silence_date") != today and user_age_h >= thr
             and silence_window(pcfg)[0] <= local.hour < silence_window(pcfg)[1]):
         org["silence_date"] = today
-        hit = random.random() < silence_p(pcfg)
+        hit = random.random() < silence_p(pcfg) * factor
         save_state(st)
         if hit:
             return {"intent": "silence", "about": "",
                     "trigger": {"type": "silence_care",
                                 "threshold_h": thr}}
-        return {"reason": "本轮没有触发"}
+        # 未命中不直接收尾：下面还有轻触/自发分享的机会
+    # 3.5) 轻触：被晾攒到 4 条以上、且超过他通常回复间隔的 1.5 倍还没
+    # 动静时，偶尔（organic.light_touch_p，默认 0.02/tick）轻轻碰一下：
+    # 内容取今日已到点的生活事件或当前日程，不追问；仍受最上面的有机
+    # 间隔约束。这是低概率通道，不是任何意义上的停发补偿闸。
+    if streak >= 4:
+        med = reply_stats(st).get("median_latency")
+        overdue = (user_age_h * 3600 >= float(med) * 1.5) if med \
+            else (user_age_h >= thr)
+        prof0 = _life.owner_profile(now)
+        act0 = prof0.get("active_hours") or []
+        ok_hour = (local.hour in act0) \
+            if act0 and not prof0.get("insufficient") \
+            else (silence_window(pcfg)[0] <= local.hour
+                  < silence_window(pcfg)[1])
+        if overdue and ok_hour \
+                and random.random() < oc_f("light_touch_p", 0.02):
+            done = [e for e in plan.get("events") or []
+                    if float(e.get("share_at", 0) or 0) <= now]
+            about = str(done[-1].get("text") or "") if done \
+                else _life.current_block(plan, now)
+            return {"intent": "impulse", "about": about,
+                    "trigger": {"type": "light_touch", "streak": streak}}
     # 4) 自发小分享
     prof = _life.owner_profile(now)
     active = prof.get("active_hours") or []
@@ -863,11 +970,14 @@ def decide(now=None):
     # 先对账：被发送端作废的主动消息没送达，先从台账里标出来再结算
     if reconcile_voided(st):
         save_state(st)
-    # 先结算他对既往主动消息的回应（决定浮动上限与冷却）
+    # 先结算他对既往主动消息的回应（喂回应率统计、浮动上限与情绪模型）
     if resolve_replies(st, now, float(ctx.get("received_at", 0)),
                        window_h=float(rhythm0.get("reply_window_hours", 12)),
                        cooldown_h=float(rhythm0.get("cooldown_hours", 24))):
         save_state(st)
+    # 情绪模型同步：streak 只调制概率/间隔/简报，永不拦截（见 mood_state）
+    mood = mood_state(st, today)
+    save_state(st)
     # awaiting 解锁：上一条主动已结算（回了或被晾超过窗口），等待标记自动失效，
     # 否则一条被晾的消息会让她从此永久沉默（冷却另有门控，不靠这里防打扰）
     if st.get("awaiting_reply"):
@@ -880,23 +990,24 @@ def decide(now=None):
             st["awaiting_reply"] = False
             save_state(st)
     # 到期 followup 提前判定：是他自己提过的事，优先级高于随机问候——
-    # 不被条数上限和随机间隔误伤（静默时段/冷却/等待回复等礼貌门控仍生效）
+    # 不被随机间隔误伤（静默时段等礼貌门控仍生效）；2026-10-27 起它与
+    # 条数上限之间也不再有豁免耦合：daily_max 填数字时上限对所有
+    # intent 一致生效，缺省（null）时本就没有上限这道闸。
     due_follow_pre = [f for f in st.get("followups", [])
                       if float(f.get("after_ts", 0)) <= now]
-    if now < float(st.get("cooldown_until", 0)):
-        return no("连续被晾，冷却中")
     q0, q1 = (pcfg.get("quiet_hours") or [0, 7])[:2]
     quiet_rare = False
     if q0 <= local.hour < q1:
         # 静默时段是硬闸：默认任何模式都不许过。唯一例外是 organic 模式
         # 显式开启的 quiet_rare（默认关、周上限 1 次、低概率），且例外只
-        # 豁免这一道闸——后面的总量/未回复/冷却等门控一律照旧。
+        # 豁免这一道闸——后面的其余门控（context/活动避让/填数字时的
+        # 总量上限）一律照旧。
         if _quiet_rare_ok(st, pcfg, now, local):
             quiet_rare = True
         else:
             return no("静默时段")
     cap = effective_cap(st, pcfg, today)
-    if not due_follow_pre and sent_last_24h(st, now) >= cap:
+    if cap is not None and sent_last_24h(st, now) >= cap:
         return no(f"滚动 24 小时已达上限 {cap} 条")
     gap_blocked_until = 0.0
     if st.get("last_sent_at") and not due_follow_pre:
@@ -912,14 +1023,10 @@ def decide(now=None):
         if not nxt and now - float(st["last_sent_at"]) < \
                 float(pcfg.get("min_gap_hours", 3)) * 3600:
             return no("距上次主动太近")
-    # 未回复并存上限：允许最多 unresolved_max 条主动消息同时等回复
-    # （2026-10-22 放开：2 → 3，改 config 可调），再多必须等他先回任意一条。
-    # 作废条目（voided）根本没送达，不算未回复——否则两条作废攒满
-    # 会把引擎永久堵死（2026-10-22 实测：晚安+早安两条作废堵住午饭档）。
-    unresolved = [e for e in st.get("log", [])
-                  if e.get("replied") is None and not e.get("voided")]
-    if len(unresolved) >= int(pcfg.get("unresolved_max", 3)):
-        return no(f"已有{len(unresolved)}条主动没被回复")
+    # （2026-10-27 撤除：未回复并存上限与未回复熔断两道闸。被晾的条数
+    # 从此只进情绪模型当调制信号——概率衰减、间隔拉长、简报带情绪，
+    # 见 mood_state 与 _organic_pick；config 里的 unresolved_max /
+    # unreplied_stop 键自此不再被读取，老配置带着它们也无副作用。）
     # 「主动话题刚聊完」标记：他回过上一条主动、且他最新一条消息还在
     # 1 小时内。2026-10-23 复盘 P1 之前它在这里全局拦截一切 intent
     # （早期版本此门曾全局拦截一切 intent），与 impulse 口径
@@ -933,9 +1040,6 @@ def decide(now=None):
         st.get("last_sent_at")
         and float(ctx.get("received_at", 0)) > float(st["last_sent_at"])
         and now - float(ctx.get("received_at", 0)) < 3600)
-    counters = read_json(COUNTERS_FILE, {}) or {}
-    if int(counters.get("unreplied", 0)) >= int(pcfg.get("unreplied_stop", 5)):
-        return no("他已经好几条没回了")
     last_activity = max(float(ctx.get("received_at", 0)), _last_reply_ts(),
                         float(st.get("last_sent_at") or 0))
     if last_activity and now - last_activity < float(pcfg.get("active_skip_min", 30)) * 60:
@@ -952,7 +1056,7 @@ def decide(now=None):
         # 有机模式：触发完全由今日生活计划 + 生活事件 + 采样阈值决定，
         # 不再走固定时段窗/固定概率的排班（下方 else 分支）。安全闸都在
         # 本节之前、与 fixed 共用，未命中直接按其 reason 收尾。
-        _org = _organic_pick(st, pcfg, now, local, ctx)
+        _org = _organic_pick(st, pcfg, now, local, ctx, mood=mood)
         if not _org.get("intent"):
             return no(_org.get("reason") or "本轮没有触发")
     if due_follow:
@@ -1008,6 +1112,8 @@ def decide(now=None):
                 p_eff = float(slot.get("p", 0.3))
                 if int(sk.get("hit", 0)) >= 2:
                     p_eff *= 0.5
+                # 情绪调制：被晾越多时段问候越收敛（保底必中不受调制）
+                p_eff *= mood["factor"]
                 hit = random.random() < p_eff
             if hit:
                 sk["hit"] = int(sk.get("hit", 0)) + 1
@@ -1077,7 +1183,7 @@ def decide(now=None):
                     break
             if (not already and not sil_recent and user_age_h >= silence_h and active_ok
                     and silence_window(pcfg)[0] <= local.hour < silence_window(pcfg)[1]):
-                hit = random.random() < silence_p(pcfg)
+                hit = random.random() < silence_p(pcfg) * mood["factor"]
                 prev_attempts = int(roll.get("attempts", 1)) \
                     if roll and roll.get("date") == today else 0
                 st.setdefault("slot_rolls", {})["silence"] = {
@@ -1085,7 +1191,7 @@ def decide(now=None):
                     "attempts": prev_attempts + 1}
                 save_state(st)
                 append_roll({"ts": now, "date": today, "slot": "silence",
-                             "hit": hit, "p": silence_p(pcfg),
+                             "hit": hit, "p": silence_p(pcfg) * mood["factor"],
                              "attempts": prev_attempts + 1})
                 if hit:
                     intent = "silence"
@@ -1102,7 +1208,7 @@ def decide(now=None):
             if (imp_today < int(rhythm.get("impulse_daily_max", 1)) and active_ok
                     and user_age_h >= 0.5
                     and silence_window(pcfg)[0] <= local.hour < silence_window(pcfg)[1]
-                    and random.random() < float(rhythm.get("impulse_p", 0.03))):
+                    and random.random() < float(rhythm.get("impulse_p", 0.03)) * mood["factor"]):
                 intent = "impulse"
     if not intent:
         return no("本轮没有触发")
@@ -1125,6 +1231,10 @@ def decide(now=None):
             "life_state": {
                 "mood": plan.get("mood", ""), "busy_level": plan.get("busy_level", ""),
                 "day_kind": plan.get("day_kind", ""), "now_block": block,
+                "mood_carry": plan.get("mood_carry") or "",
+                "mood_streak": {"n": mood["streak"], "label": mood["label"]},
+                "events_done": [e.get("text", "") for e in plan.get("events") or []
+                                if float(e.get("share_at", 0) or 0) <= now],
                 "owner_adapt": plan.get("owner_adapt") or {}},
             "schedule": block,
             "events": [e.get("text", "") for e in plan.get("events") or []],
@@ -1291,6 +1401,22 @@ def mark_sent(intent, about="", event="", message_id=""):
         lo = max(0.05, _gf("gap_sample_min_h", 0.3))
         hi = max(lo + 0.1, _gf("gap_sample_max_h", 5.0))
         gap_h = math.exp(random.uniform(math.log(lo), math.log(hi)))
+        # 情绪调制（间隔拉长）：发送前台账尾部连续未回复（含待结算）
+        # 每多一条，这次间隔 ×1.5 累加，封顶 ×3.5；他都回了就是 ×1。
+        # 与 resolve_replies 同口径判「已回复」：context 收到时间晚于
+        # 该条发送时刻即算回过。只是拉长，永不构成停发。
+        _ctx = read_json(CONTEXT_FILE, {}) or {}
+        _ctx_at = float(_ctx.get("received_at", 0) or 0)
+        _prev = 0
+        for _e in reversed(st.get("log", [])):
+            if _e.get("voided"):
+                continue
+            if _e.get("replied") is True:
+                break
+            if _ctx_at and _ctx_at > float(_e.get("ts", 0) or 0):
+                break
+            _prev += 1
+        gap_h *= min(1.0 + 0.5 * _prev, 3.5)
         st["next_allowed_at"] = now + gap_h * 3600
     else:
         gap = rhythm.get("gap_hours") or [2.5, 4.5]

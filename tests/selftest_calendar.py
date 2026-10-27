@@ -272,8 +272,9 @@ def c1():
           got == {"2026-11-01": 2, "2026-10-31": 1, "2026-10-30": 0},
           f"got={got}")
 
-    # C1d followup 跨日：昨日约定的 followup 次日仍 due 且豁免滚动上限；
-    # 超 48h 的被清；无 followup 时同台账被上限挡住（对照）
+    # C1d followup 跨日：昨日约定的 followup 次日仍 due（C1d-1b）；
+    # 2026-10-27 起 followup 不再豁免滚动上限（撤耦合）——上限已满时
+    # 同样被挡（C1d-1，与 C1d-3 对照同口径）；超 48h 的被清（C1d-2）
     now = ts(2026, 10, 26, 10, 0)
     log20 = [{"ts": now - 3600 - i * 60, "intent": "morning",
               "replied": True} for i in range(20)]
@@ -281,7 +282,14 @@ def c1():
         now, ctx_age_h=1.0, extra_state={"log": log20},
         followups=[{"about": "他提过的面试", "after_ts": ts(2026, 10, 25, 9, 0)}])
     r = m.decide(now=now)
-    check("C1d-1 昨日 followup 次日 due 且豁免滚动 24h 上限",
+    check("C1d-1 followup 不再豁免滚动上限（已满 18 条照拦）",
+          r.get("due") is not True and "上限" in str(r.get("reason", "")),
+          f"r={r}")
+    home, m = make_pro_home(
+        now, ctx_age_h=1.0,
+        followups=[{"about": "他提过的面试", "after_ts": ts(2026, 10, 25, 9, 0)}])
+    r = m.decide(now=now)
+    check("C1d-1b 昨日 followup 次日仍 due（无上限占用时）",
           r.get("due") is True and r.get("intent") == "followup",
           f"r={r}")
     home, m = make_pro_home(

@@ -191,6 +191,37 @@ def main():
           and all(isinstance(x, str) for x in s.get("events_later", [])),
           str(s)[:160])
 
+    # L12 跨日延续：心情延续不变量 + 历史落盘（滚动账本两天都在）
+    home, m = make_home()
+    p1 = m.generate_today(ts(2026, 10, 21, 8, 0))
+    hw1 = json.load(open(os.path.join(home, "state", "life_history.json"),
+                         encoding="utf-8"))["walk"]["work"]
+    p2 = m.generate_today(ts(2026, 10, 22, 8, 0))
+    hist = json.load(open(os.path.join(home, "state", "life_history.json"),
+                          encoding="utf-8"))
+    check("L12 心情跨日延续不变量 + 历史落盘",
+          "2026-10-21" in hist["days"] and "2026-10-22" in hist["days"]
+          and (not p2.get("mood_carry") or p2["mood"] == p1["mood"]),
+          f"carry={p2.get('mood_carry')} m1={p1['mood']} m2={p2['mood']}")
+    # L13 近 N 天生活事件不重复（池足够大时第二天与第一天零交集）
+    ev1 = {e["text"] for e in p1["events"]}
+    ev2 = {e["text"] for e in p2["events"]}
+    check("L13 近 3 天生活事件不重复", not (ev1 & ev2), f"{ev1 & ev2}")
+    # L14 事件带兴奋度：全部 ∈(0,1]，且兴奋事件（≥0.75）存在
+    pool = m._event_pool(m.persona_life())
+    check("L14 事件带兴奋度且兴奋事件存在",
+          bool(pool) and all(0 < e["excitement"] <= 1.0 for e in pool)
+          and any(e["excitement"] >= 0.75 for e in pool),
+          str(pool[:2])[:100])
+    # L15 作息基准小步漂移：相邻同类日步长 ≤45 分钟且不越钳制界
+    #     （walk 账本存 hist["walk"][kind] = 最新一日的基准）
+    w2 = hist["walk"]["work"]
+    check("L15 作息基准小步漂移且不越界",
+          abs(w2["wake"] - hw1["wake"]) <= 45
+          and abs(w2["sleep"] - hw1["sleep"]) <= 45
+          and 450 - 45 <= hw1["wake"] <= 450 + 60,
+          f"{hw1} -> {w2}")
+
     passed = sum(1 for _, ok in RESULTS if ok)
     print(f"\n==== life selftest: {passed}/{len(RESULTS)} PASS ====")
     return 0 if passed == len(RESULTS) else 1
