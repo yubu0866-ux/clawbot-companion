@@ -34,6 +34,14 @@ TIMEOUT = 1800
 
 
 def main():
+    # 入口自身输出先切 UTF-8：Windows 默认 cp1252 下打印失败套件中文尾部
+    # 会 UnicodeEncodeError 崩溃（CI 首跑 Windows 格实证），子进程另有
+    # PYTHONUTF8=1 注入，此处只保入口进程自身的 print。
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     only = sys.argv[1] if len(sys.argv) > 1 else ""
     env = dict(os.environ)
     env["TZ"] = "Asia/Shanghai"

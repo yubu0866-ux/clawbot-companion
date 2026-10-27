@@ -1,5 +1,6 @@
 # clawbot-companion 运行依赖（Python >= 3.10，推荐 3.12）
 Pillow>=10.0        # bridge.py 媒体处理（图片探测/处理）
+qrcode>=7.4        # bridge.py login：ASCII 二维码与 qr.png 生成（缺失时 T1a/T1b 失败）
 numpy>=1.26         # scripts/audio_screen.py、scripts/audio_repair.py 音频筛查
 tzdata>=2024.1; sys_platform == "win32"   # Windows 没有系统时区数据库，zoneinfo 依赖它
 

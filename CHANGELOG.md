@@ -2,6 +2,13 @@
 
 本项目所有值得注意的变更都记录在这里。格式参考 Keep a Changelog，按日期倒序排列（最新在最上方）。维护约定：后续每次更新都在本文件顶部新增一段，与代码变更同一提交进仓。
 
+## 2026-10-27 — CI 双矩阵首跑修复
+
+### Fixed
+
+- **Ubuntu 格 channel 自检 T1a/T1b 失败**：根因为 `requirements.txt` 漏列 `bridge.py` login 实际依赖的 `qrcode` 包（本地开发机装有该包、干净检出环境没有，导致 ASCII 二维码与 `qr.png` 双双生成失败）。已补 `qrcode>=7.4`；干净 venv（仅旧依赖）复现 T1a/T1b 双败、补装后全过，与 CI 日志逐项对齐。
+- **Windows 格 tune 套件崩溃 + 汇总打印崩溃**：`tests/selftest_tune.py`、`selftest_proactive.py`、`selftest_worker.py` 的并发写用例直接调 `multiprocessing.get_context("fork")`（Windows 无 fork，建上下文即抛错；另两处子进程函数还是嵌套定义、spawn 下无法 pickle）。三处改为按平台选 fork/spawn，两个嵌套子进程函数提为模块级；`tests/run_all.py` 入口自身输出先切 UTF-8（此前 Windows 默认 cp1252 下打印中文失败尾部会 `UnicodeEncodeError` 二次崩溃、掩盖真失败）。工作流自检步骤另加 `PYTHONUTF8=1` 兜底（workflow 文件因应用权限需经网页端更新，见提交说明）。
+
 ## 2026-10-27 — Windows 支持
 
 ### Added

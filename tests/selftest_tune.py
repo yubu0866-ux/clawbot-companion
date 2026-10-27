@@ -23,6 +23,18 @@ def check(name, ok, detail=""):
     print(("PASS " if ok else "FAIL ") + name + (f"（{detail}）" if not ok and detail else ""))
 
 
+def _race_child(modpath, target, tag, n):
+    # 模块级函数：Windows spawn 子进程按引用导入，嵌套函数无法 pickle；
+    # fork 与 spawn 两路共用，参数均为可 pickle 的纯数据。
+    spec = importlib.util.spec_from_file_location("race_mod", modpath)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    payload = {"tag": tag, "pad": "x" * 20000, "n": 0}
+    for i in range(n):
+        payload["n"] = i
+        m.write_json(target, payload)
+
+
 def load_tune(home):
     spec = importlib.util.spec_from_file_location("tune_sbx", os.path.join(home, "tune.py"))
     m = importlib.util.module_from_spec(spec)
@@ -217,18 +229,10 @@ def main():
     # 抢走临时文件（修复前实证 FileNotFoundError 崩溃，bughunt 面 1）
     from multiprocessing import get_context
 
-    def _race_child(modpath, target, tag, n):
-        spec = importlib.util.spec_from_file_location("race_mod", modpath)
-        m = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(m)
-        payload = {"tag": tag, "pad": "x" * 20000, "n": 0}
-        for i in range(n):
-            payload["n"] = i
-            m.write_json(target, payload)
-
     home12 = make_home()
     target12 = os.path.join(home12, "state", "race.json")
-    ctx12 = get_context("fork")
+    # fork 仅 POSIX 可用；Windows 用 spawn（_race_child 已提为模块级函数）
+    ctx12 = get_context("fork" if os.name != "nt" else "spawn")
     ps = [ctx12.Process(target=_race_child,
                         args=(os.path.join(home12, "tune.py"), target12, t, 150))
           for t in ("A", "B")]

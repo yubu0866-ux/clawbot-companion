@@ -24,6 +24,18 @@ def check(name, ok, detail=""):
     print(("PASS " if ok else "FAIL ") + name + (f"（{detail}）" if not ok and detail else ""))
 
 
+def _race_child62(modpath, target, tag, n):
+    # 模块级函数：Windows spawn 子进程按引用导入，嵌套函数无法 pickle；
+    # fork 与 spawn 两路共用，参数均为可 pickle 的纯数据。
+    spec = importlib.util.spec_from_file_location("race_mod62", modpath)
+    mm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mm)
+    payload = {"tag": tag, "pad": "x" * 20000, "n": 0}
+    for i in range(n):
+        payload["n"] = i
+        mm.write_json(target, payload)
+
+
 def ts(y, mo, d, h, mi=0):
     return datetime(y, mo, d, h, mi, tzinfo=TZ).timestamp()
 
@@ -945,18 +957,10 @@ def main():
     # 抢走临时文件（修复前实证 FileNotFoundError 崩溃，bughunt 面 1）
     from multiprocessing import get_context
 
-    def _race_child62(modpath, target, tag, n):
-        spec = importlib.util.spec_from_file_location("race_mod62", modpath)
-        mm = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mm)
-        payload = {"tag": tag, "pad": "x" * 20000, "n": 0}
-        for i in range(n):
-            payload["n"] = i
-            mm.write_json(target, payload)
-
     home62, _m62 = make_home(t1500, slots={})
     target62 = os.path.join(home62, "state", "race.json")
-    ctx62 = get_context("fork")
+    # fork 仅 POSIX 可用；Windows 用 spawn（_race_child62 已提为模块级函数）
+    ctx62 = get_context("fork" if os.name != "nt" else "spawn")
     ps62 = [ctx62.Process(target=_race_child62,
                           args=(os.path.join(home62, "proactive.py"), target62, t, 150))
             for t in ("A", "B")]

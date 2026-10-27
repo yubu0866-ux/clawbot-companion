@@ -622,7 +622,8 @@ def test_finish_concurrency():
     # 跨进程：serve 侧 bump_unreplied 与 worker 侧 post(flaw) 同写 counters
     with open(os.path.join(sdir, "counters.json"), "w", encoding="utf-8") as f:
         json.dump({"unreplied": 0, "flaw_total": 0}, f)
-    ctx = get_context("fork")
+    # fork 仅 POSIX 可用；Windows 用 spawn（_child_bump/_child_flaw 已是模块级函数）
+    ctx = get_context("fork" if os.name != "nt" else "spawn")
     pa = ctx.Process(target=_child_bump, args=(home, 60))
     pb = ctx.Process(target=_child_flaw, args=(home, 60))
     pa.start()
