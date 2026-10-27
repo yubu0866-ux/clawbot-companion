@@ -12,11 +12,20 @@ outbox（kind=proactive），再用 sent 记账。发送端 bridge 还有第二�
 生成的 state/life.json（缺失时回落 facts.json 的 life 字段）。
 门控与触发优先级（followup > 时段 roll > 长静默 > impulse）见 decide()。
 
+proactive.mode="organic" 时改走有机主动引擎：不再用固定时段窗与固定
+概率排班，而是读 life.py 每日按日期种子采样的生活计划
+（state/life_today.json）——锚点时刻（起床后/午休/下班后/睡前）自带
+随机抖动与当日跳过，她的生活事件到分享时刻触发 impulse，长静默关怀
+阈值按日采样，两次主动间隔对数正态采样。全部安全闸（每日上限、未回
+复并存/熔断、静默时段、context 新鲜度、冷却）与 fixed 模式共用、位置
+不变。mode 缺省或 life.py 不可用时回落 fixed（兼容旧行为）。
+
 CLI: tick [--now TS] / sent --intent X [--about T] [--event S] [--message-id M] / dry-run / status
 """
 import argparse
 import fcntl
 import json
+import math
 import os
 import random
 import sys
@@ -44,6 +53,19 @@ PENDING_DIR = os.path.join(HOME, "outbox", "pending")
 PAUSED_FILE = os.path.join(STATE, "PAUSED")
 NEEDS_RELOGIN_FILE = os.path.join(STATE, "NEEDS_RELOGIN")
 FACTS_FILE = os.path.join(HOME, "facts.json")
+
+# life.py（生活圈子/每日计划/主人画像）是同目录模块：按本文件所在路径
+# 显式加载（与 worker.py 的 _load 同法），避免 import 缓存串到别处的
+# 同名模块；没拷 life.py 时容错回落，有机模式自动不可用、行为等同
+# fixed，绝不因缺模块崩溃。
+try:
+    import importlib.util as _ilu
+    _life_spec = _ilu.spec_from_file_location(
+        "clawbot_life", os.path.join(HERE, "life.py"))
+    _life = _ilu.module_from_spec(_life_spec)
+    _life_spec.loader.exec_module(_life)
+except Exception:
+    _life = None
 # 长静默触发参数（默认值，可被 config.proactive.silence_p / silence_window 覆盖）
 SILENCE_P = 0.85
 SILENCE_WINDOW = (9, 22)  # 长静默触发只在白天到晚上 22 点前
@@ -666,6 +688,145 @@ def _peer_id():
     return ""
 
 
+def proactive_mode(pcfg=None):
+    """主动引擎模式：config.proactive.mode == "organic" 且 life.py 可用时
+    为 organic，其余一律 fixed（缺省兼容旧行为）。"""
+    if pcfg is None:
+        pcfg = cfg().get("proactive") or {}
+    if _life is not None and str(pcfg.get("mode") or "fixed") == "organic":
+        return "organic"
+    return "fixed"
+
+
+def _organic_pick(st, pcfg, now, local, ctx):
+    """有机模式触发判定（只在全部安全闸已通过、且无到期 followup 时调用）。
+
+    按今日生活计划（life.ensure_today）依次看：
+    1. 计划锚点：未跳过、已到点且在追赶窗（默认 120 分钟）内的锚点 →
+       以其 intent（morning/lunch/evening/goodnight）触发；过窗未发的
+       锚点直接作废（像真人：忙过了就不会补发一句迟到的早安）。
+    2. 生活事件：share_at 已到、未分享过的事件 → impulse，about 为事件
+       本身；每日事件分享上限 organic.event_daily_max（默认 3）。
+    3. 长静默关怀：主人静默超过今日采样阈值（计划里的
+       silence_threshold_h，默认在 2.5-6 小时内采样）且在可打扰时段内，
+       按 silence_p 掷一次（当日只掷一次）。
+    4. 自发小分享：低概率（organic.spontaneous_p，默认 0.02/tick）、
+       主人已静默 ≥0.5 小时、且在他大概率在的时段。
+    返回 {"intent","about","trigger"} 或 {"reason"}；命中/作废的锚点与
+    事件记入 st["organic"]["fired"] 并落盘（decide 在锁内执行）。"""
+    oc = pcfg.get("organic") or {}
+    plan = _life.ensure_today(now)
+    today = plan.get("date") or local.date().isoformat()
+    org = st.get("organic")
+    if not isinstance(org, dict) or org.get("date") != today:
+        # quiet_rare_dates 是跨日滚动 7 天的账，不能随当日状态一起清掉
+        keep = (org or {}).get("quiet_rare_dates") or [] \
+            if isinstance(org, dict) else []
+        org = {"date": today, "fired": [], "silence_date": None,
+               "quiet_rare_dates": keep}
+        st["organic"] = org
+    fired = org.setdefault("fired", [])
+    changed = False
+
+    def oc_f(key, default):
+        try:
+            return float(oc.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    # 有机间隔：mark_sent 已按采样间隔写好 next_allowed_at，这里只认它
+    nxt = float(st.get("next_allowed_at") or 0)
+    if nxt and now < nxt:
+        return {"reason": "距下一次可主动的时间还没到"}
+    catchup = oc_f("moment_catchup_min", 120.0) * 60
+    # 1) 计划锚点
+    for m in plan.get("moments") or []:
+        mid = str(m.get("id") or "")
+        if not mid or mid in fired:
+            continue
+        mts = float(m.get("ts", 0) or 0)
+        if now > mts + catchup:
+            fired.append(mid)  # 过窗作废，不补发
+            changed = True
+            continue
+        if m.get("skip") or now < mts:
+            continue
+        fired.append(mid)
+        changed = True
+        if changed:
+            save_state(st)
+        return {"intent": str(m.get("intent") or "impulse"), "about": "",
+                "trigger": {"type": "plan", "moment": m.get("kind"),
+                            "label": f"今日计划锚点 {m.get('time', '')}"}}
+    # 2) 生活事件分享
+    evt_max = int(oc_f("event_daily_max", 3))
+    evt_done = sum(1 for f in fired if f.startswith(f"{today}:evt"))
+    if evt_done < evt_max:
+        for e in plan.get("events") or []:
+            eid = str(e.get("id") or "")
+            if not eid or eid in fired:
+                continue
+            if now >= float(e.get("share_at", 0) or 0):
+                fired.append(eid)
+                save_state(st)
+                return {"intent": "impulse", "about": str(e.get("text") or ""),
+                        "trigger": {"type": "life_event",
+                                    "event": e.get("text"),
+                                    "event_kind": e.get("kind"),
+                                    "who": e.get("who")}}
+    # 3) 长静默关怀（阈值按日采样，当日只掷一次）
+    user_age_h = (now - float(ctx.get("received_at", now))) / 3600.0
+    thr = float(plan.get("silence_threshold_h") or 4.0)
+    if (org.get("silence_date") != today and user_age_h >= thr
+            and silence_window(pcfg)[0] <= local.hour < silence_window(pcfg)[1]):
+        org["silence_date"] = today
+        hit = random.random() < silence_p(pcfg)
+        save_state(st)
+        if hit:
+            return {"intent": "silence", "about": "",
+                    "trigger": {"type": "silence_care",
+                                "threshold_h": thr}}
+        return {"reason": "本轮没有触发"}
+    # 4) 自发小分享
+    prof = _life.owner_profile(now)
+    active = prof.get("active_hours") or []
+    active_ok = (local.hour in active) if active and not prof.get("insufficient") \
+        else (silence_window(pcfg)[0] <= local.hour < silence_window(pcfg)[1])
+    if (active_ok and user_age_h >= 0.5
+            and random.random() < oc_f("spontaneous_p", 0.02)):
+        return {"intent": "impulse", "about": "",
+                "trigger": {"type": "spontaneous"}}
+    if changed:
+        save_state(st)
+    return {"reason": "本轮没有触发"}
+
+
+def _quiet_rare_ok(st, pcfg, now, local):
+    """静默时段的「稀有例外」判定（仅 organic 模式、默认关）：真人偶尔
+    也会在深夜突然想起一句话，但这必须是极少数。开启需显式配置
+    organic.quiet_rare.enabled=true；命中还要求近 7 天用过的例外次数
+    小于 max_per_week（默认 1）。判定只掷骰与查账，不落盘——真正记账
+    在 decide 确定 due 后做，避免没发出去也占名额。"""
+    if proactive_mode(pcfg) != "organic":
+        return False
+    qr = (pcfg.get("organic") or {}).get("quiet_rare") or {}
+    if qr.get("enabled", False) is not True:
+        return False
+    org = st.get("organic") or {}
+    dates = org.get("quiet_rare_dates") or []
+    today_ord = local.date().toordinal()
+    used = sum(1 for d in dates
+               if isinstance(d, str) and d and
+               today_ord - datetime.fromisoformat(d).date().toordinal() < 7) \
+        if dates else 0
+    try:
+        max_week = int(qr.get("max_per_week", 1))
+        p = float(qr.get("p", 0.05))
+    except (TypeError, ValueError):
+        return False
+    return used < max_week and random.random() < p
+
+
 def decide(now=None):
     """返回 dict：{due, reason} 或 {due:True, intent, about, brief, ...}。"""
     now = now or time.time()
@@ -725,8 +886,15 @@ def decide(now=None):
     if now < float(st.get("cooldown_until", 0)):
         return no("连续被晾，冷却中")
     q0, q1 = (pcfg.get("quiet_hours") or [0, 7])[:2]
+    quiet_rare = False
     if q0 <= local.hour < q1:
-        return no("静默时段")
+        # 静默时段是硬闸：默认任何模式都不许过。唯一例外是 organic 模式
+        # 显式开启的 quiet_rare（默认关、周上限 1 次、低概率），且例外只
+        # 豁免这一道闸——后面的总量/未回复/冷却等门控一律照旧。
+        if _quiet_rare_ok(st, pcfg, now, local):
+            quiet_rare = True
+        else:
+            return no("静默时段")
     cap = effective_cap(st, pcfg, today)
     if not due_follow_pre and sent_last_24h(st, now) >= cap:
         return no(f"滚动 24 小时已达上限 {cap} 条")
@@ -773,14 +941,29 @@ def decide(now=None):
     if last_activity and now - last_activity < float(pcfg.get("active_skip_min", 30)) * 60:
         return no("刚刚还在聊")
 
-    # ---- 触发（优先级：followup > 时段 > 长静默） ----
+    # ---- 触发（优先级：followup > 时段 > 长静默；organic 模式见下） ----
     intent = None
     about = ""
+    organic_trigger = {}
     profile = user_profile()
     due_follow = due_follow_pre
+    _org = None
+    if not due_follow and not quiet_rare and proactive_mode(pcfg) == "organic":
+        # 有机模式：触发完全由今日生活计划 + 生活事件 + 采样阈值决定，
+        # 不再走固定时段窗/固定概率的排班（下方 else 分支）。安全闸都在
+        # 本节之前、与 fixed 共用，未命中直接按其 reason 收尾。
+        _org = _organic_pick(st, pcfg, now, local, ctx)
+        if not _org.get("intent"):
+            return no(_org.get("reason") or "本轮没有触发")
     if due_follow:
         due_follow.sort(key=lambda f: float(f.get("after_ts", 0)))
         intent, about = "followup", str(due_follow[0].get("about", ""))
+    elif quiet_rare:
+        intent, about = "impulse", ""
+        organic_trigger = {"type": "quiet_rare"}
+    elif _org is not None:
+        intent, about = _org["intent"], _org.get("about", "")
+        organic_trigger = _org.get("trigger") or {}
     else:
         slots = pcfg.get("slots") or {}
         now_min = local.hour * 60 + local.minute
@@ -929,6 +1112,23 @@ def decide(now=None):
         # 生活设定回落来源：facts.json 的 life 字段（persona/facts 驱动）
         facts_doc = read_json(FACTS_FILE, {}) or {}
         life = facts_doc.get("life") or {}
+    organic_brief = None
+    if organic_trigger and _life is not None:
+        # 有机模式的生成契约：给生成层的不再是「时段标签」，而是触发缘由
+        # （trigger：计划锚点/生活事件/静默关怀/自发分享）+ 她当下的生活
+        # 状态摘要（life_state）+ 今日生活计划的事件与心情；life_schedule /
+        # life_events / mood_now 等旧键同步改从今日计划取，保持字段兼容。
+        plan = _life.ensure_today(now)
+        block = _life.current_block(plan, now)
+        organic_brief = {
+            "trigger": organic_trigger,
+            "life_state": {
+                "mood": plan.get("mood", ""), "busy_level": plan.get("busy_level", ""),
+                "day_kind": plan.get("day_kind", ""), "now_block": block,
+                "owner_adapt": plan.get("owner_adapt") or {}},
+            "schedule": block,
+            "events": [e.get("text", "") for e in plan.get("events") or []],
+            "mood_now": plan.get("mood", ""), "busy_level": plan.get("busy_level", "")}
     hist = read_jsonl(HISTORY_FILE)[-4:]
     # 发送时刻再抹一层随机：followup 用小抖动，时段/静默类用 0-10 分钟
     # 抖动，避免总是踩着整点网格出现，同时不再把发送窗口拉得太长——
@@ -963,6 +1163,8 @@ def decide(now=None):
     video_ok = intent in ("evening", "silence", "impulse")
     wp = float(rhythm.get("photo_p", 1.0)) if photo_ok else 0.0
     wv = float(rhythm.get("video_p", 1.0)) if video_ok else 0.0
+    if quiet_rare:
+        wp = wv = 0.0  # 深夜稀有例外只发文字，不半夜发图/视频
     if wp + wv > 0:
         if wp and wv:
             form = "photo" if random.random() * (wp + wv) < wp else "video"
@@ -985,6 +1187,13 @@ def decide(now=None):
     elif form == "video":
         video_subject = _subject("video")
         double = False
+    if quiet_rare:
+        org = st.get("organic") or {}
+        dates = list(org.get("quiet_rare_dates") or [])
+        dates.append(today)
+        org["quiet_rare_dates"] = dates[-8:]
+        st["organic"] = org
+        save_state(st)
     flavor = pick_flavor(st, intent)
     if flavor:
         st["pending_flavor"] = flavor
@@ -999,11 +1208,17 @@ def decide(now=None):
             "context_token": ctx.get("context_token", ""),
             "send_after": now + jitter * 60,
             "brief": {
-                "life_schedule": life.get("schedule", ""),
-                "life_events": life.get("small_events", []),
+                "life_schedule": organic_brief["schedule"] if organic_brief
+                                 else life.get("schedule", ""),
+                "life_events": organic_brief["events"] if organic_brief
+                               else life.get("small_events", []),
                 "used_events_today": used_events_today(st, today),
-                "mood_now": life.get("mood_now", ""),
-                "busy_level": life.get("busy_level", ""),
+                "mood_now": organic_brief["mood_now"] if organic_brief
+                            else life.get("mood_now", ""),
+                "busy_level": organic_brief["busy_level"] if organic_brief
+                              else life.get("busy_level", ""),
+                "trigger": organic_brief["trigger"] if organic_brief else {},
+                "life_state": organic_brief["life_state"] if organic_brief else {},
                 "recent_history": [{"role": h.get("role", ""),
                                     "text": str(h.get("text", ""))[:40]}
                                    for h in hist]}}
@@ -1059,9 +1274,27 @@ def mark_sent(intent, about="", event="", message_id=""):
     # 注：2026-10-21 曾有「他一贯秒回则间隔收紧到 0.75-1.5 小时」的浮动
     # 分支，那是基线还是 2.5-4.5 小时时定的；基线改为 [0.4, 1.0] 后，
     # 该分支反而把间隔拉长到定版之外（与原意反转），2026-10-23 复盘移除。
-    rhythm = (cfg().get("proactive") or {}).get("rhythm") or {}
-    gap = rhythm.get("gap_hours") or [2.5, 4.5]
-    st["next_allowed_at"] = now + random.uniform(float(gap[0]), float(gap[1])) * 3600
+    _pcfg = cfg().get("proactive") or {}
+    rhythm = _pcfg.get("rhythm") or {}
+    if proactive_mode(_pcfg) == "organic":
+        # 有机间隔：对数正态采样——多数时候一两个小时，偶尔很快（像想起
+        # 第二句）、偶尔大半天安静；只有下限是硬的（采样区间下界），
+        # 没有固定节拍。区间由 organic.gap_sample_min_h/max_h 配置。
+        oc = _pcfg.get("organic") or {}
+
+        def _gf(key, default):
+            try:
+                return float(oc.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        lo = max(0.05, _gf("gap_sample_min_h", 0.3))
+        hi = max(lo + 0.1, _gf("gap_sample_max_h", 5.0))
+        gap_h = math.exp(random.uniform(math.log(lo), math.log(hi)))
+        st["next_allowed_at"] = now + gap_h * 3600
+    else:
+        gap = rhythm.get("gap_hours") or [2.5, 4.5]
+        st["next_allowed_at"] = now + random.uniform(float(gap[0]), float(gap[1])) * 3600
     if intent == "silence":
         st["last_silence_date"] = today
     if intent == "impulse":
@@ -1162,7 +1395,7 @@ def main(argv=None):
             pcfg = cfg().get("proactive") or {}
             today = datetime.now(tz()).date().isoformat()
             stats = reply_stats(st)
-            print(json.dumps({"state": st,
+            print(json.dumps({"state": st, "mode": proactive_mode(pcfg),
                               "effective_cap": effective_cap(st, pcfg, today),
                               "sent_last_24h": sent_last_24h(st, time.time()),
                               "day_counts": derive_day_counts(st),

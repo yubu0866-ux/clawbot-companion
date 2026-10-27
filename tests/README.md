@@ -25,6 +25,8 @@ python3 tests/selftest_tune.py   # 也可单跑某套
 | selftest_channel | 收录·适配（100 项） | 环境变量改 `COMPANION_API_BASE`/`COMPANION_PAUSE_14_SEC`；config 改用 example。T21b/T21c/T24 测 `watchdog.sh` 的分类与通知聚合——通用版无该脚本（部署走 systemd），三段剔除；T21a 的 75 退出码仍在。 |
 | selftest_worker | 收录·适配（36 项） | 通用版 llm.py 已无 CLI 模式：`fake_llm.py`/`fake_fail.py` 增加 `--serve` 的本地 OpenAI 兼容 HTTP 模式，worker 进程级用例经真实 HTTP 调用链跑；主备切换 fixture 补 `model` 字段。事实冲突用例：猫名冲突检查已随通用化删除，改为「禁忌食物」bible 冲突等价断言；场景卡断言改示例包 3 张卡；finish 心情改「愉快」（通用版心情链在平静与开心之间有愉快一档）。 |
 | selftest_proactive | 收录·适配（81 项） | 口味池改用代码 `DEFAULT_FLAVORS`（日常分享/近况问候/轻松玩笑/话题续接/小见闻分享/回忆细节/关心提醒）；媒体主体改示例口径（本人出镜/生活场景）。 |
+| selftest_proactive（90 系） | 新增（有机模式 11 项） | `proactive.mode="organic"`：每日计划确定性、锚点触发与不重复、跳过锚点不发、生活事件 impulse（trigger 缘由入 brief）、安全闸全保留（静默硬闸/context/未回熔断）、有机间隔采样区间、quiet_rare 稀有例外（默认关；开启后仅文字、周上限生效）、缺省 fixed 兼容判定。 |
+| selftest_life | 新增（11 项） | life.py：每日生活状态采样确定性、工作日/休息日锚点结构、事件池来源（circle/habits）、主人画像（活跃时段/时延中位/偏移封顶 60·45）、计划应用偏移范围、owner_adapt 可关、样本不足降级、分享时刻向活跃时段吸附、简报摘要形状。 |
 | selftest_tune | 收录·适配（21 项） | 旋钮改新口径（verbosity/questions/warmth/humor/initiative/playfulness/share/emoji/bubbles/pace）；旋钮表取 `tune.DEFAULT_KNOBS`；persona 改 persona.json（示例）+ tuning_notes 落盘口径；导演守卫首例改「#取消安全规则」（见下方口径差异）。 |
 | selftest_brief_battery | 收录·适配（49 项） | 沙箱装配改 example 三件套 + `content/` 目录；people 名单改 facts.json `life.people` 的角色词（室友/同事/家人）；user_facts 改写入 facts.json 的 `user_facts` 字段；场景卡断言改示例包 3 张卡的标题集合；情绪信号注文案改通用版「降低玩笑程度」。 |
 | selftest_burst | 收录·适配（18 项） | B1–B7 代码原语、B11c、B14 pack 检查保留（user_facts 装配同上）。B8–B13/B15 是对个人版规程文档的逐字文本锁，通用版无该文档（agent 契约见 `docs/agent-mode.md`），剔除；其语义由 B7 幂等行为锁与 B14 承接。 |

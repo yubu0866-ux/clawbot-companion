@@ -64,6 +64,42 @@
 | `rhythm.photo_p` / `rhythm.video_p` | number | 主动媒体形式裁定的相对权重：照片可达意图 morning/evening/silence，视频可达 evening/silence/impulse；同为可达时按权重二选一，两者都为 0 则纯文字（默认各 1.0）。分形式条数不单独设限，只受 `daily_max` 总量约束 |
 | `rhythm.photo_self_p` / `rhythm.video_self_p` | number | 媒体主体抽中首项（本人出镜）的概率（默认 0.7） |
 
+### 有机主动模式与生活系统（`proactive.mode` / `life.py`）
+
+`proactive.mode` 有两个取值：
+
+- `fixed`（缺省）：上文的固定时段窗 + 固定概率排班，行为与旧版一致。
+- `organic`：主动节奏不再排班，改为读 `life.py` 每天采样生成的**生活计划**行动。全部安全闸（`daily_max`、未回复并存/熔断、静默时段、context 新鲜度、冷却、观察期）在两种模式下完全一致、位置不变；followup（约定跟进）仍最高优先级。
+
+有机模式的日常是这样运转的：
+
+1. **每日计划**：`life.py` 按「日期 + 角色名」做种子，每天确定性采样一次，落 `state/life_today.json`：今日日程块、主动锚点、1–3 件生活事件、心情基调、当日静默关怀阈值。同日重复生成结果一致。
+2. **锚点时刻**：由角色作息骨架（见下 `routine`）推出起床后 / 午休 / 下班后（休息日为下午）/ 睡前四个锚点，各带 ±`anchor_jitter_min`（默认 45 分钟）随机抖动与当日跳过概率——不是每天每个点都会出声；错过追赶窗（`moment_catchup_min`，默认 120 分钟）的锚点直接作废，不补发迟到的问候。
+3. **生活事件驱动**：计划里的生活事件各有采样出的分享时刻，到点以 impulse 形式分享（每日上限 `event_daily_max`，默认 3），生成层拿到的是事件本身而不是时段标签；另有极低概率的自发分享（`spontaneous_p`，默认 0.02/轮）。
+4. **采样静默阈值与间隔**：长静默关怀的触发阈值按日在 `silence_threshold_h`（默认 [2.5, 6] 小时）内采样，当日只掷一次；两条主动之间的间隔在 [`gap_sample_min_h`, `gap_sample_max_h`]（默认 [0.3, 5] 小时）内做对数正态采样——多数一两小时，偶尔很快，偶尔大半天安静，没有固定节拍。
+5. **生成契约**：decide 返回的 brief 里带 `trigger`（触发缘由：plan / life_event / silence_care / spontaneous / quiet_rare）与 `life_state`（她当下的心情、日程块、忙碌度），文案据此生成，不再有模板化问候感。
+
+`proactive.organic` 参数（全部可缺省，缺失走默认值）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `organic.anchor_jitter_min` | number | 锚点时刻的随机抖动幅度（±分钟，默认 45） |
+| `organic.wakeup_skip_p` / `lunch_skip_p` / `afterwork_skip_p` / `bedtime_skip_p` | number | 四个锚点各自的当日跳过概率（默认 0.15 / 0.35 / 0.20 / 0.10） |
+| `organic.event_daily_max` | number | 生活事件分享的每日上限（默认 3） |
+| `organic.gap_sample_min_h` / `gap_sample_max_h` | number | 主动间隔对数正态采样的下/上界（小时，默认 0.3 / 5.0） |
+| `organic.silence_threshold_h` | [number, number] | 静默关怀阈值的按日采样区间（小时，默认 [2.5, 6.0]） |
+| `organic.spontaneous_p` | number | 自发小分享每轮触发概率（默认 0.02） |
+| `organic.moment_catchup_min` | number | 锚点过时作废的追赶窗（分钟，默认 120） |
+| `organic.quiet_rare` | object | 静默时段的稀有例外，**默认关**：`{enabled: false, p: 0.05, max_per_week: 1}`。开启后仅 organic 模式下、深夜可能以低概率放行一条**纯文字**主动（滚动 7 天至多 `max_per_week` 次），其余全部门控照旧。不开启时静默时段就是硬闸 |
+
+**生活圈子与习惯（人设扩展）**：在 `persona.json` 的 `life` 里（或 `facts.json` 的 `life` 里，同名键 facts 优先）新增三段，示例人设已带：
+
+- `life.routine`：`{workday: {wake, work_start, lunch: [起, 止], work_end, sleep}, restday: {wake, sleep}, rest_days?: [0-6]}`，作息骨架，锚点与日程块都从它推出。
+- `life.circle`：她生活里的人（与「宠物」）：`[{name, role, trait, join, activities: [...]}]`，`join` 是事件文本里名字前的连接词（如「和」，宠物可给空串）；事件池按 activities 里的时段词（午饭/晚上/早上等）自动配分享时段窗。
+- `life.habits`：日常仪式：`[{label, time_hint: morning|noon|evening|any, text}]`，与 circle 事件、通用事件池混合采样成每日 1–3 件生活事件。
+
+**主人适配（owner adaptation）与隐私**：`life.py` 从本地 `state/history.jsonl` 统计主人近 14 天的活跃时段分布、常回时延中位数与互动密度，落 `state/owner_profile.json`（每 6 小时至多重算一次）。适配是克制的：早安/晚安锚点向主人作息偏移，硬封顶（早安 +60/−30 分钟、晚安 +45/−30 分钟，且再受 `organic.owner_adapt.shift_max_min`，默认 60，总封一次）；事件分享时刻优先吸附到主人大概率在的整点（±2 小时内才吸附）。样本不足（<20 条消息或 <5 天）不做任何偏移。这些数据**只存在本地 `state/`，不上传、不进 git**；`organic.owner_adapt.enabled=false` 可整体关闭（关闭后不再读 history 算画像），删掉 `state/owner_profile.json` 与 `state/life_today.json` 即清除全部适配与计划状态。
+
 ### limits（数值硬门）
 
 `bridge.py` 的发送侧数值硬门（只管 `kind="reply"` 轮次，违规整组作废留痕）**优先读本段**，键名如下；任一键缺失或非法时回落到代码内的同值常量默认。所以调小这里的某个上限，硬门判定会随之变严，不需要改代码。

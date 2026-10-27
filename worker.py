@@ -40,6 +40,10 @@ def _load(mod_name, fname):
 bridge = _load("bridge", "bridge.py")
 llm = _load("llm", "llm.py")
 tune = _load("tune", "tune.py")
+try:
+    life_mod = _load("life", "life.py")
+except Exception:
+    life_mod = None  # 生活圈子模块缺失时优雅降级：简报不带 life_today 摘要
 
 STATE = bridge.STATE
 PERSONA_FILE = os.path.join(bridge.HOME, "persona.json")
@@ -744,6 +748,19 @@ def bracket_emoji_recent(n=10):
     return "；".join(parts)
 
 
+def _life_brief():
+    """life.py 的今日生活状态与主人画像摘要（生活圈子/有机主动）：她今天
+    的心情、日程块、生活事件与主人作息适配，供回复时自然带出自己的生活。
+    模块缺失或失败时回两个空 dict，简报其余部分不受影响；摘要在
+    life.py 侧已压缩（只给文本与关键数字），token 量级可控。"""
+    if life_mod is None:
+        return {}, {}
+    try:
+        return life_mod.brief_summary(), life_mod.owner_summary()
+    except Exception:
+        return {}, {}
+
+
 def round_brief():
     """给生成回复用的轮次简报：心情、冷却词、可用梗、他的风格、是否话变少。"""
     cooling, _, _ = cooling_words()
@@ -804,6 +821,14 @@ def daily_prep():
     life = bridge.read_json(LIFE_FILE, {}) or {}
     if life.get("date") != today:
         generate_life(unfinished or life.get("carry_over", ""))
+    if life_mod is not None:
+        # 同步生成今日生活计划（life_today.json）并刷新主人适配画像，
+        # 供 proactive 有机模式与本简报共用；失败只记日志、不拦主流程
+        try:
+            life_mod.ensure_today()
+            life_mod.owner_profile()
+        except Exception as e:
+            wlog(f"生活计划/主人画像更新失败（不影响主流程）：{e}")
     bridge.write_json_locked(DAILY_PREP_FILE, {"date": today, "done_at": time.time()})
     wlog(f"每日准备完成：昨日摘要与今日 life.json 已就绪（{today}）")
 
@@ -2368,8 +2393,11 @@ def build_pack():
         t, d = _fact_text(e)  # 双格式兼容（见 _fact_text）：字符串条目无日期不入今日段
         if d == today and t:
             facts_today.append(t)
+    life_today_sum, owner_prof_sum = _life_brief()
     return {
         "life": bridge.read_json(LIFE_FILE, {}) or {},
+        "life_today": life_today_sum,
+        "owner_profile": owner_prof_sum,
         "memories": mem.get("memories", []),
         "facts_today": facts_today,
         "summaries": [{"date": s.get("date", ""), "text": s.get("text", ""),

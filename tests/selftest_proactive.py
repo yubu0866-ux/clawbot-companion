@@ -28,18 +28,44 @@ def ts(y, mo, d, h, mi=0):
     return datetime(y, mo, d, h, mi, tzinfo=TZ).timestamp()
 
 
+ORGAN_PERSONA = {
+    "name": "测试角", "gender": "female",
+    "life": {
+        "circle": [
+            {"name": "同事", "role": "colleague", "join": "和",
+             "activities": ["一起赶完了手头的稿子"]},
+            {"name": "团团", "role": "pet", "join": "",
+             "activities": ["把水杯推下了桌"]}],
+        "habits": [
+            {"label": "晚间散步", "time_hint": "evening",
+             "text": "晚饭后下楼散步走了两圈"}],
+        "routine": {
+            "workday": {"wake": "07:30", "work_start": "09:00",
+                        "lunch": ["12:00", "13:00"], "work_end": "18:00",
+                        "sleep": "23:00"},
+            "restday": {"wake": "08:30", "sleep": "23:30"}}}}
+
+
 def make_home(now, slots=None, ctx_age_h=2.0, extra_state=None, followups=None,
-              history=None, rhythm=None):
+              history=None, rhythm=None, mode=None, organic=None, persona=None):
     home = tempfile.mkdtemp(prefix="pro-test-")
     os.makedirs(os.path.join(home, "state"))
     os.makedirs(os.path.join(home, "inbox"))
     shutil.copy(os.path.join(ROOT, "proactive.py"), os.path.join(home, "proactive.py"))
+    shutil.copy(os.path.join(ROOT, "life.py"), os.path.join(home, "life.py"))
     pcfg = {"enabled": True, "daily_max": 3, "min_gap_hours": 3,
             "quiet_hours": [0, 7], "silence_hours": 5,
             "active_skip_min": 30, "max_context_age_hours": 24,
             "send_jitter_min": [0, 0],
             "slots": slots if slots is not None else
                      {"morning": {"p": 1.0, "window": ["07:30", "09:30"]}}}
+    if mode is not None:
+        pcfg["mode"] = mode
+    if organic is not None:
+        pcfg["organic"] = organic
+    if persona is not None:
+        with open(os.path.join(home, "persona.json"), "w", encoding="utf-8") as f:
+            json.dump(persona, f, ensure_ascii=False)
     if rhythm is not None:
         pcfg["rhythm"] = {"impulse_p": 0.0, "photo_p": 0.0, "video_p": 0.0, **rhythm}
     else:
@@ -1159,6 +1185,118 @@ def main():
           and e73c.get("form_delivered") == "text"
           and "degrade_reason" not in e73c,
           f"a={e73a} b={e73b} c={e73c}")
+
+    # ---- 90 系：有机模式（organic） ----
+    t0700 = ts(2026, 10, 21, 7, 0)  # 周三
+    # 90. 有机计划确定性：同日两次生成的锚点/事件/心情完全一致
+    home, m = make_home(t0700, mode="organic", persona=ORGAN_PERSONA,
+                        organic={"spontaneous_p": 0.0})
+    plan_a = m._life.ensure_today(t0700)
+    plan_b = m._life.generate_today(t0700)
+    check("90 有机计划同日确定性",
+          plan_a == plan_b and plan_a.get("date") == "2026-10-21"
+          and len(plan_a.get("moments") or []) == 4
+          and 1 <= len(plan_a.get("events") or []) <= 3,
+          str(plan_a)[:160])
+    # 91. 锚点到点 → due，intent 与锚点一致，brief 带 trigger/life_state
+    home, m = make_home(t0700, mode="organic", persona=ORGAN_PERSONA,
+                        organic={"spontaneous_p": 0.0})
+    plan = m._life.ensure_today(t0700)
+    live = [x for x in plan["moments"] if not x["skip"]]
+    if live:
+        mm = live[0]
+        now91 = float(mm["ts"]) + 120
+        with open(os.path.join(home, "state", "context.json"), "w", encoding="utf-8") as f:
+            json.dump({"context_token": "tok-test",
+                       "received_at": now91 - 2 * 3600, "stale": False}, f)
+        d = m.decide(now=now91)
+        check("91 有机锚点到点触发",
+              d.get("due") and d.get("intent") == mm["intent"]
+              and (d.get("brief") or {}).get("trigger", {}).get("type") == "plan"
+              and (d.get("brief") or {}).get("life_state", {}).get("mood")
+              == plan["mood"],
+              str(d)[:200])
+        d2 = m.decide(now=now91 + 60)
+        check("91b 同一锚点不重复触发", not d2.get("due")
+              or d2.get("intent") != mm["intent"], str(d2)[:120])
+    else:
+        check("91 有机锚点到点触发", False, "当日锚点全跳过，样本异常")
+    # 92. 全部锚点跳过 + 无事件到期 → 不发（跳过是当日采样的一部分）
+    home, m = make_home(t0700, mode="organic", persona=ORGAN_PERSONA,
+                        organic={"spontaneous_p": 0.0, "wakeup_skip_p": 1.0,
+                                 "lunch_skip_p": 1.0, "afterwork_skip_p": 1.0,
+                                 "bedtime_skip_p": 1.0})
+    plan92 = m._life.ensure_today(t0700)
+    wake92 = [x for x in plan92["moments"] if x["kind"] == "wakeup"][0]
+    now92 = float(wake92["ts"]) + 120
+    with open(os.path.join(home, "state", "context.json"), "w", encoding="utf-8") as f:
+        json.dump({"context_token": "tok-test",
+                   "received_at": now92 - 2 * 3600, "stale": False}, f)
+    d = m.decide(now=now92)
+    check("92 被跳过的锚点不触发", not d.get("due"), str(d)[:120])
+    # 93. 生活事件到分享时刻 → impulse，about 为事件文本，trigger 标缘由
+    home, m = make_home(t0700, mode="organic", persona=ORGAN_PERSONA,
+                        organic={"spontaneous_p": 0.0})
+    plan93 = m._life.ensure_today(t0700)
+    ev = plan93["events"][0]
+    now93 = float(ev["share_at"]) + 60
+    st93 = json.load(open(os.path.join(home, "state", "proactive.json")))
+    st93["organic"] = {"date": "2026-10-21",
+                       "fired": [x["id"] for x in plan93["moments"]],
+                       "silence_date": None}
+    json.dump(st93, open(os.path.join(home, "state", "proactive.json"), "w"),
+              ensure_ascii=False)
+    with open(os.path.join(home, "state", "context.json"), "w", encoding="utf-8") as f:
+        json.dump({"context_token": "tok-test",
+                   "received_at": now93 - 2 * 3600, "stale": False}, f)
+    d = m.decide(now=now93)
+    check("93 有机生活事件分享",
+          d.get("due") and d.get("intent") == "impulse"
+          and d.get("about") == ev["text"]
+          and (d.get("brief") or {}).get("trigger", {}).get("type") == "life_event",
+          str(d)[:200])
+    # 94. 有机模式安全闸全保留：静默时段 / context 太旧 / 未回熔断
+    home, m = make_home(ts(2026, 10, 21, 3, 0), mode="organic",
+                        persona=ORGAN_PERSONA, organic={"spontaneous_p": 0.0})
+    check("94a 有机模式凌晨静默硬闸（rare 默认关）",
+          not m.decide(now=ts(2026, 10, 21, 3, 0)).get("due"))
+    home, m = make_home(t0830, mode="organic", persona=ORGAN_PERSONA,
+                        ctx_age_h=30, organic={"spontaneous_p": 0.0})
+    check("94b 有机模式 context 太旧不发",
+          not m.decide(now=t0830).get("due"))
+    home, m = make_home(t0830, mode="organic", persona=ORGAN_PERSONA,
+                        organic={"spontaneous_p": 0.0})
+    with open(os.path.join(home, "state", "counters.json"), "w", encoding="utf-8") as f:
+        json.dump({"unreplied": 5}, f)
+    check("94c 有机模式连续未回熔断不发",
+          not m.decide(now=t0830).get("due"))
+    # 95. 有机间隔采样：mark_sent 后 next_allowed_at 落在采样区间内，
+    #     且间隔未到时 decide 不发
+    home, m = make_home(time.time(), mode="organic", persona=ORGAN_PERSONA,
+                        organic={"spontaneous_p": 0.0})
+    st95 = m.mark_sent("impulse")
+    gap95 = (float(st95["next_allowed_at"]) - float(st95["last_sent_at"])) / 3600
+    check("95 有机间隔在采样区间 [0.3, 5] 小时",
+          0.29 <= gap95 <= 5.01, f"gap={gap95:.2f}h")
+    # 96. 静默稀有例外：显式开启 + p=1 时凌晨可发一条（仅文字），
+    #     同周第二次被周上限挡住
+    t0300 = ts(2026, 10, 21, 3, 0)
+    home, m = make_home(t0300, mode="organic", persona=ORGAN_PERSONA,
+                        organic={"spontaneous_p": 0.0,
+                                 "quiet_rare": {"enabled": True, "p": 1.0,
+                                                "max_per_week": 1}})
+    d = m.decide(now=t0300)
+    check("96a quiet_rare 开启后凌晨可发",
+          d.get("due") and d.get("intent") == "impulse"
+          and d.get("form") == "text"
+          and (d.get("brief") or {}).get("trigger", {}).get("type") == "quiet_rare",
+          str(d)[:160])
+    d = m.decide(now=t0300 + 1800)
+    check("96b quiet_rare 周上限 1 次后不再放行", not d.get("due"), str(d)[:120])
+    # 97. 缺省 mode 仍是 fixed（兼容）：mode 函数判定 + 时段行为不变
+    home, m = make_home(t0830)
+    pcfg97 = json.load(open(os.path.join(home, "config.json")))["proactive"]
+    check("97 缺省 fixed 模式判定", m.proactive_mode(pcfg97) == "fixed")
 
     passed = sum(1 for _, ok in RESULTS if ok)
     print(f"\n==== proactive selftest: {passed}/{len(RESULTS)} PASS ====")

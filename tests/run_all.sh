@@ -18,6 +18,7 @@ selftest_brief_battery.py
 selftest_burst.py
 selftest_calendar.py
 selftest_proactive.py
+selftest_life.py
 selftest_worker.py
 selftest_pressure.py
 selftest_channel.py
