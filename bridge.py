@@ -38,8 +38,8 @@ from zoneinfo import ZoneInfo
 # ---- 跨平台文件锁（portable lock shim）----
 # POSIX 用 fcntl.flock；Windows 没有 fcntl，改用 msvcrt.locking 对锁文件
 # 第 0 字节加范围锁。语义对齐：默认阻塞等锁，nb=True 时冲突立即抛
-# OSError（与 flock LOCK_NB 一致）；msvcrt 的阻塞锁约 10 秒后放弃并抛
-# OSError，本桥的锁都很短暂，不构成实际差异。
+# OSError（与 flock LOCK_NB 一致）；阻塞锁用非阻塞轮询 + 让步实现真阻塞
+# （msvcrt 的 LK_LOCK 约 10 秒即放弃，高并发下会悄悄退化成无锁，见下）。
 try:
     import fcntl
 
@@ -57,7 +57,22 @@ except ImportError:  # Windows
             os.lseek(fh, 0, os.SEEK_SET)
             os.write(fh, b"\0")
         os.lseek(fh, 0, os.SEEK_SET)
-        msvcrt.locking(fh, msvcrt.LK_NBLCK if nb else msvcrt.LK_LOCK, 1)
+        if nb:
+            msvcrt.locking(fh, msvcrt.LK_NBLCK, 1)
+            return
+        # 阻塞锁必须真阻塞：msvcrt 的 LK_LOCK 约 10 秒即放弃并抛 OSError，
+        # 而 _StateLock 会把 OSError 吞掉继续跑——高并发下悄悄退化成无锁
+        # （16 进程 hammer 式抢锁即此风险）。改用非阻塞轮询 + 让步，上限
+        # 120 秒，到时仍抛 OSError 走原有兜底路径。
+        deadline = time.monotonic() + 120
+        while True:
+            try:
+                msvcrt.locking(fh, msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.02)
 
     def _flock_un(fd):
         fh = fd if isinstance(fd, int) else fd.fileno()
@@ -1643,7 +1658,10 @@ def _fetch_inbound_image(msg, log=serve_log):
             return None, cred
         with open(os.path.join(MEDIA_IN, mid + "." + ext), "wb") as f:
             f.write(data)
-        return os.path.join("state", "media_in", mid + "." + ext), cred
+        # 存储的相对路径一律用正斜杠：os.path.join 在 Windows 上产出反斜杠，
+        # 会打破 inbox/history 里 state/media_in/... 的既定口径（CI Windows 格
+        # T18a/T18c 实证）；正斜杠在 Windows 文件操作里同样合法。
+        return "state/media_in/" + mid + "." + ext, cred
     except Exception as e:
         log(f"入站图片降级 id={mid} 类别=异常 {type(e).__name__}")
         return None, cred
@@ -1721,7 +1739,7 @@ def _extract_video_frames(mp4_abs, mid, log=serve_log):
             except OSError:
                 ok = False
         if ok:
-            frames.append(os.path.join("state", "media_in", f"{mid}.f{i}.jpg"))
+            frames.append(f"state/media_in/{mid}.f{i}.jpg")  # 存储路径正斜杠，见图片侧同款说明
         else:
             try:
                 os.remove(out_abs)
@@ -1788,7 +1806,7 @@ def _fetch_inbound_video(msg, log=serve_log):
         mp4_abs = os.path.join(MEDIA_IN, mid + ".mp4")
         with open(mp4_abs, "wb") as f:
             f.write(data)
-        video_rel = os.path.join("state", "media_in", mid + ".mp4")
+        video_rel = "state/media_in/" + mid + ".mp4"  # 存储路径正斜杠，见图片侧同款说明
         frames = _extract_video_frames(mp4_abs, mid, log=log)
         if not frames:
             log(f"入站视频降级 id={mid} 类别=抽帧失败（mp4 已落盘、无帧图）")

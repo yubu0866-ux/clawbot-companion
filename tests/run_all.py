@@ -77,7 +77,14 @@ def main():
                 print(f"FAIL (exit={rc})")
                 try:
                     with open(log_path, encoding="utf-8", errors="replace") as lf:
-                        tail = lf.read().splitlines()[-30:]
+                        lines = lf.read().splitlines()
+                    # 失败行优先：只打尾部 30 行时，失败项常在日志中段、
+                    # CI 里根本看不到（2026-10-27 第三次运行实证）。
+                    fails = [l for l in lines if "FAIL" in l]
+                    if fails:
+                        print(f"---- {name} 失败行（共 {len(fails)} 行） ----")
+                        print("\n".join(fails))
+                    tail = lines[-30:]
                     print(f"---- {name} 输出尾部 ----")
                     print("\n".join(tail))
                     print("----------------------")

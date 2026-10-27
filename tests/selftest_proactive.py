@@ -304,6 +304,13 @@ def main():
     home, m = make_home(t0830, extra_state={
         "awaiting_reply": True, "last_sent_at": t0830 - 13 * 3600,
         "log": [{"ts": t0830 - 13 * 3600, "intent": "morning", "replied": False}]})
+    # 本项断言的是 awaiting 解锁本身，不是时段 roll：情绪调制会把 morning
+    # 槽概率从 1.0 压到 0.85，不强制 roll 约 15% 的运行会偶发失败
+    # （CI 两格 99/100 与本地复现均系此项）；按 21b 先例强制 roll 命中。
+    # decide 后续路径还用到 choice/uniform，一并给确定性实现（首元素/下限）。
+    m.random = _types.SimpleNamespace(
+        random=lambda: 0.0, randint=lambda a, b: a,
+        choice=lambda seq: seq[0], uniform=lambda a, b: a)
     d = m.decide(now=t0830)
     st_after = json.load(open(os.path.join(home, "state", "proactive.json"),
                               encoding="utf-8"))

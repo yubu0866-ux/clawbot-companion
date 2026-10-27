@@ -2,6 +2,19 @@
 
 本项目所有值得注意的变更都记录在这里。格式参考 Keep a Changelog，按日期倒序排列（最新在最上方）。维护约定：后续每次更新都在本文件顶部新增一段，与代码变更同一提交进仓。
 
+## 2026-10-27 — CI 双矩阵第三轮失败修复
+
+### Fixed
+
+- **Windows 格 channel 自检 T18a/T18c/T19b/T19e 失败**：入站图片/视频落盘后，`bridge.py` 用 `os.path.join` 拼存储相对路径，在 Windows 上产出反斜杠（`state\media_in\...`），与 inbox/history 里 `state/media_in/...` 的既定口径不符，断言逐项失败（CI 日志 `mf=state\media_in\IMGOK1.png` 实证）。三处存储路径（图片、视频、抽帧）一律改正斜杠拼接；正斜杠在 Windows 文件操作里同样合法，Linux 行为不变。
+- **Windows 格 channel 自检 T21a 失败**：退出码 75 本身是对的，栽在 pid 断言上。根因是 Windows 的 `terminate()` 直接杀进程、不走优雅退出，旧 serve 的 pid 文件不会被清理；T21a 的 `wait_until` 立刻命中旧文件，`pid_before` 读到 stale 值。测试侧在起新 serve 前先删旧 pid 文件（断言本身未动：仍要求第二 serve 以 75 退出、日志留痕、pid 未被覆盖）。
+- **proactive 自检偶发 99/100（两格同败）**：20 项断言 `due=True`，但情绪调制把 morning 槽概率从 1.0 压到 0.85，不强制 roll 时约 15% 的运行会偶发失败（本地干净环境 5 遍复现 1 次，失败项正是 20 项）。按 21b 先例强制该项的 roll 命中（`random`/`randint`/`choice`/`uniform` 一并给确定性实现）；断言本身未动，产品行为未改。
+- **Windows 格 pressure 自检失败（P4 多进程 hammer）**：`bridge.py` 的 Windows 阻塞锁用 `msvcrt` 的 LK_LOCK，约 10 秒即放弃并抛错，而 `_StateLock` 会把该错误吞掉继续跑——高并发下悄悄退化成无锁，计数丢失。阻塞锁改用非阻塞轮询 + 让步实现真阻塞（上限 120 秒，到时仍抛错走原有兜底）。
+
+### Changed
+
+- **失败定位**：`tests/run_all.py` 对失败套件除打印尾部 30 行外，另打印全部 FAIL 行——此前 CI 第三次运行的 proactive/pressure 失败项因只打尾部、日志里全是 PASS 行而无法定位（本次修复范围，教训记入）。
+
 ## 2026-10-27 — CI 双矩阵首跑修复
 
 ### Fixed

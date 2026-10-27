@@ -1497,6 +1497,12 @@ try:
     # T21a：先起一个 serve 持锁，再启第二个 serve——必须以专属退出码 75
     # 退出并在 serve.log 留痕，不覆盖 pid 文件（T14 起本套件无常驻 serve，
     # 故这里自起一个，测完即停）。
+    # 先删旧 serve.pid：Windows 的 terminate() 直接杀进程、不走优雅退出，
+    # 旧 serve 的 pid 文件不会被清理；不删则 wait_until 立刻命中旧文件、
+    # pid_before 读到 stale 值，断言必败（CI Windows 格实证）。
+    _stale_pid = os.path.join(STATE, "serve.pid")
+    if os.path.exists(_stale_pid):
+        os.remove(_stale_pid)
     serve2 = subprocess.Popen([sys.executable, BRIDGE, "serve"], env=ENV,
                               stdout=open(os.path.join(STATE, "serve.out.log"), "a"),
                               stderr=subprocess.STDOUT)
