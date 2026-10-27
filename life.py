@@ -444,10 +444,11 @@ def generate_today(now=None):
     walk = hist.setdefault("walk", {})
     wstate = walk.get(day_kind) or {}
     step = _f(oc.get("anchor_walk_step_min"), 8.0)
-    # 两个高斯抽样无条件先抽：保证同一天重复生成的 rng 序列完全一致
-    # （每日计划确定性），复用分支不许少抽。
-    g_wake = rng.gauss(0, step)
-    g_sleep = rng.gauss(0, step)
+    # 高斯抽样走独立种子的 RNG：不扰动主采样流（锚点/事件/阈值的既有
+    # 采样值保持稳定），且同一天重复生成结果一致（每日计划确定性）。
+    _wrng = random.Random(f"clawbot-life-walk|{date_str}|{persona_name()}")
+    g_wake = _wrng.gauss(0, step)
+    g_sleep = _wrng.gauss(0, step)
     if wstate.get("date") == date_str and wstate.get("wake") is not None:
         wake = int(wstate["wake"])
         sleep = int(wstate["sleep"])
