@@ -99,7 +99,28 @@ def main():
     if failed:
         print("失败套件:" + " ".join(failed))
     _write_step_summary(passed, failed, fail_detail)
+    _emit_error_annotations(failed, fail_detail)
     return 1 if failed else 0
+
+
+def _emit_error_annotations(failed, fail_detail):
+    """GitHub Actions annotation 通道：每个失败套件发一条 ::error，
+    标题带套件名、正文带头几条 FAIL 行——annotation 在 run/commit 页
+    不点开 job 日志也可见，是 Step Summary 之外的第二条定位通道。
+    仅 Actions 环境（GITHUB_ACTIONS=true）输出，本地运行不污染输出；
+    workflow command 转义：% 先行，再 \\r/\\n。"""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+
+    def esc(s):
+        return (s.replace("%", "%25").replace("\r", "%0D")
+                 .replace("\n", "%0A"))[:300]
+
+    for name in failed:
+        fails, _tail = fail_detail.get(name, ([], []))
+        head = " | ".join(f.strip() for f in fails[:3]) or "exit!=0（无 FAIL 行）"
+        print(f"::error title=selftest FAIL {esc(name)}::{esc(head)}",
+              flush=True)
 
 
 def _write_step_summary(passed, failed, fail_detail):
