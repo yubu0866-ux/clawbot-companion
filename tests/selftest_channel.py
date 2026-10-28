@@ -299,12 +299,17 @@ try:
     pending_file("A-2.json", "A", "第二条", send_after=t0 + 2.5)
     ok = wait_until(lambda: len(MS.sent) >= n_sent + 2, 20)
     new = MS.sent[n_sent:]
+    # 组尾 typing 2 是 serve 在末条发出后另发的独立调用，慢盘/慢机
+    # 上会晚于「两条已发」信号片刻——按被断言状态本身等它落地，
+    # 不改判定口径（CI Windows 实证）。
+    ok_typing = wait_until(
+        lambda: len(MS.typing) >= 2 and MS.typing[-1]["status"] == 2, 10)
     typing_statuses = [t["status"] for t in MS.typing]
     check("T7a 按顺序发送", ok and [s["text"] for s in new] == ["第一条", "第二条"],
           str([s["text"] for s in new]))
     check("T7b send_after 生效（第二条不早于约定时间）",
           ok and new[1]["ts"] >= t0 + 2.3, f"ts={new[1]['ts'] - t0 if ok else '无'}")
-    check("T7c typing 1 在发送前、2 在组尾", typing_statuses[:1] == [1] and typing_statuses[-1:] == [2]
+    check("T7c typing 1 在发送前、2 在组尾", ok_typing and typing_statuses[:1] == [1] and typing_statuses[-1:] == [2]
           and MS.typing[0]["ts"] <= new[0]["ts"], str(typing_statuses))
 
     # ---------- T8 拆条打断 ----------
@@ -805,6 +810,11 @@ try:
           and FAKE_URL not in probe_raw and "fake-cdn" not in probe_raw
           and VOICE_TEXT not in probe_raw)
     # 媒体消息处理路径未受影响：inbox 记录照常落盘（图归 image、语音转写归 text）
+    # 探针在 body 开头就写、记录在 fetch/落盘后才成形，两者可见时刻
+    # 天然有差；慢机上记录会晚于探针数秒——按被断言的记录本身等
+    # 落地，不改判定口径（CI Windows 实证）。
+    wait_until(lambda: (rj(os.path.join(inbox_dir, "PVOI1.json"), {}) or {})
+               .get("type") == "text", 20)
     img_inbox = rj(os.path.join(inbox_dir, "PIMG1.json"), {}) or {}
     voi_inbox = rj(os.path.join(inbox_dir, "PVOI1.json"), {}) or {}
     n_probe = len(probe_lines())
