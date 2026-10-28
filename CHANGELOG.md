@@ -33,6 +33,7 @@
 - **CI Windows 格 round28 平台语义适配**：R5 的 fsync 计数断言按平台分流（目录 fsync 是 POSIX 概念、Windows 按设计跳过，期望 ≥1；POSIX ≥2 不变）；M3 的 `prune_media_in.sh` dry-run 实跑断言限 POSIX（该脚本为 POSIX 运维工具），Windows 只验脚本在册。
 - **失败定位（run_all）**：在 GitHub Actions 环境下把逐套结果与失败套件的 FAIL 行/输出尾部写入 Step Summary（`GITHUB_STEP_SUMMARY`），并为每个失败套件发一条 `::error` annotation（标题带套件名、正文带头几条 FAIL 行）——run 页不开 job 日志也能定位哪套哪项失败；本地运行无副作用。
 - **CI 时序竞争三修（channel T4/T11a、tune 12）**：① 入站去重 claim 改为 inbox 记录耐久落盘后立即释放（`on_stored` 回调，exists 接力去重）——此前 claim 覆盖整个 body 长尾（落盘后还有 context/history/计数等多次 fsync 写），按目录快照观察 inbox 的逻辑会撞见残留 claim；落盘前失败仍由 finally 释放、游标不推进等重投，契约由 round28 R9/R10 锁定。② 主动消息发送失败时先落 stale 标记与上限下调、再把条目移入 failed/（两条发送路径同口径）：移入是外部可观察的「失败已定」信号，标记必须先行落盘。③ `atomic_write_json` 与各模块对齐的 `write_json` 副本：`os.replace` 加瞬时锁重试（`_replace_retry`，Windows 上目标被杀软扫描/并发读者瞬时占用抛 PermissionError 时短退避吸收，真权限问题耗尽后照旧抛出）。
+- **T26c 残渣断言收窄**：该断言原为「state 目录全局无 `.tmp.` 文件」，但用例运行时 serve 正在并发做其他状态文件的原子写，其 tmp 瞬时在册会在慢盘上误报；收窄为本目标自己的 tmp 前缀，F6（本写失败留自己的 tmp 残渣）的覆盖不变。
 
 ## 2026-10-27 — README 增加反馈入口
 

@@ -1387,7 +1387,11 @@ try:
     os.replace = _orig_replace26
     check("T26c replace 失败抛错、原文件完好、无 tmp 残渣",
           _raised26 and (rj(_tgt26, {}) or {}).get("v") == 1
-          and not any(".tmp." in x for x in os.listdir(STATE)),
+          # 残渣口径收窄到本目标自己的 tmp：serve 并发运行时其他
+          # 状态文件的原子写 tmp 会瞬时在册，全局断言在慢盘上误报
+          # （CI Windows 实证）；F6 缺陷面是本写失败留自己的 tmp。
+          and not any(x.startswith("r4_atomic.json.tmp.")
+                      for x in os.listdir(STATE)),
           f"raised={_raised26}")
     if os.path.exists(_tgt26):
         os.remove(_tgt26)
