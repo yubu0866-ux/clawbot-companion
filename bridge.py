@@ -301,6 +301,21 @@ def _fsync_dir(dirpath):
         pass
 
 
+def _replace_retry(tmp, path):
+    """os.replace + 瞬时锁重试：Windows 上目标文件被杀软扫描/并发
+    读者瞬时占用时 replace 抛 PermissionError，并发连写下实证可让
+    写者进程崩溃（自检 tune 12）；短退避重试吸收瞬时窗口，真权限
+    问题重试耗尽后照旧抛出。POSIX 上 PermissionError 同理适用。"""
+    for attempt in range(10):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 9:
+                raise
+            time.sleep(0.03)
+
+
 def atomic_write_json(path, data, mode=0o644):
     tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
     try:
@@ -315,7 +330,7 @@ def atomic_write_json(path, data, mode=0o644):
             pass
         raise
     try:
-        os.replace(tmp, path)
+        _replace_retry(tmp, path)
     except OSError:
         # replace 失败（ENOSPC/跨设备等）时同样清掉 tmp，否则残渣在
         # state/ 里永久滞留（无任何 prune 覆盖该目录的 *.tmp.* 形态；
@@ -2509,23 +2524,37 @@ def _process_inbound(session, msg, my_id, state=None):
         return True  # 同 id 已在处理：由对方的结果负责，本条不重复落盘
     except OSError:
         pass  # claim 落盘失败（只读 fs 等）：退回 exists-only 旧口径，不阻断收件
+
+    def _release_claim():
+        # 幂等释放：inbox 记录耐久落盘后由 body 回调立即释放（此后
+        # exists 接力去重，见上方注释的设计口径）——若等到 body 全部
+        # 固定动作（context/history/计数等多次 fsync 写）结束才释放，
+        # claim 文件会在 inbox 目录里停留整个长尾窗口，任何按目录
+        # 快照观察 inbox 的逻辑都会撞见它（自检 T4 实证）；落盘前
+        # 失败则只能由 finally 释放、等重投重新领取。
+        nonlocal claimed
+        if claimed:
+            claimed = False
+            try:
+                os.remove(claim_path)
+            except OSError:
+                pass
+
     try:
-        _process_inbound_body(session, msg, my_id, state, mid, path)
+        _process_inbound_body(session, msg, my_id, state, mid, path,
+                              on_stored=_release_claim)
     except OSError:
         # 落盘链存储类失败（ENOSPC 等）：消息未耐久落盘，回报接收
         # 循环保持游标、等平台重投；claim 在 finally 释放，重投可
         # 重新领取本条。
         return False
     finally:
-        if claimed:
-            try:
-                os.remove(claim_path)
-            except OSError:
-                pass
+        _release_claim()
     return True
 
 
-def _process_inbound_body(session, msg, my_id, state, mid, path):
+def _process_inbound_body(session, msg, my_id, state, mid, path,
+                          on_stored=None):
     typ, text, ref_text = _classify(msg, serve_log)
     probe_inbound(msg)  # 入站媒体探针（第 0 步）：只记形态不记值，失败不影响主流程
     # 平台字段归一：context_token/from_user_id 同样清洗孤立代理对字符
@@ -2589,6 +2618,8 @@ def _process_inbound_body(session, msg, my_id, state, mid, path):
     if video_cred:
         rec["video_cred"] = video_cred  # 同 media_cred 口径：只随 inbox 记录留存
     write_json_locked(path, rec)
+    if on_stored is not None:
+        on_stored()  # inbox 记录已耐久落盘：claim 立即释放（exists 接力去重）
     # 每收到一条的固定动作：更新 context、记 history、清未回复计数、清 awaiting_reply、触发 worker
     if rec["context_token"]:
         write_context(rec["context_token"])
@@ -3443,6 +3474,14 @@ def _sender_pass(session, user_id, gap_cfg, state, skip_media=False):
                 serve_log(f"outbox {fn} 媒体发送瞬时失败（第 {data['send_attempts']} 次重试，"
                           f"{retry_delay}s 后再试）：{e}")
                 continue
+            # 主动失败的标记（stale＋下调上限）先于移入 failed/：移入
+            # 是外部可观察的「失败已定」信号，观察者看到 failed 条目
+            # 时标记必须已落盘；反序时慢盘/锁竞争会拉开两者的可见
+            # 间隔（自检 T11a 实证）。
+            if _proactive_failure_marks_stale(data, e, code):
+                mark_context_stale()
+                new_max = lower_proactive_max_age(ctx_age_h)
+                serve_log(f"主动消息失败，已标记 context stale，max_context_age_hours 下调为 {new_max:.3f}")
             _move_with_error(path, data, f"{type(e).__name__}: {e}", errcode=code)
             append_jsonl(HEALTH_FILE, {"ts": time.time(), "kind": data["kind"],
                                        "context_age_hours": round(ctx_age_h, 4), "ok": False,
@@ -3455,10 +3494,6 @@ def _sender_pass(session, user_id, gap_cfg, state, skip_media=False):
                 if aborted:
                     serve_log(f"outbox 同组回复 {group_key} token 失效，整组止损，"
                               f"另移 {aborted} 条入 failed/")
-            if _proactive_failure_marks_stale(data, e, code):
-                mark_context_stale()
-                new_max = lower_proactive_max_age(ctx_age_h)
-                serve_log(f"主动消息失败，已标记 context stale，max_context_age_hours 下调为 {new_max:.3f}")
             continue
         # 成功
         os.replace(path, os.path.join(SENT, fn))
@@ -3645,6 +3680,11 @@ def _media_sender_pass(session, user_id):
                 serve_log(f"outbox {fn} 媒体发送瞬时失败（第 {data['send_attempts']} 次重试，"
                           f"{retry_delay}s 后再试）：{e}")
                 continue
+            # 主动失败标记先于移入 failed/（与文本趟同口径，理由见彼处）。
+            if _proactive_failure_marks_stale(data, e, code):
+                mark_context_stale()
+                new_max = lower_proactive_max_age(ctx_age_h)
+                serve_log(f"主动消息失败，已标记 context stale，max_context_age_hours 下调为 {new_max:.3f}")
             _move_with_error(path, data, f"{type(e).__name__}: {e}", errcode=code)
             append_jsonl(HEALTH_FILE, {"ts": time.time(), "kind": data["kind"],
                                         "context_age_hours": round(ctx_age_h, 4),
@@ -3656,10 +3696,6 @@ def _media_sender_pass(session, user_id):
                 if aborted:
                     serve_log(f"outbox 同组回复 {group_key} token 失效，整组止损，"
                               f"另移 {aborted} 条入 failed/")
-            if _proactive_failure_marks_stale(data, e, code):
-                mark_context_stale()
-                new_max = lower_proactive_max_age(ctx_age_h)
-                serve_log(f"主动消息失败，已标记 context stale，max_context_age_hours 下调为 {new_max:.3f}")
             continue
         # 成功
         os.replace(path, os.path.join(SENT, fn))

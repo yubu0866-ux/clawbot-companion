@@ -403,6 +403,43 @@ check("R8b COMPANION_STT_PYTHON 优先", B._resolve_stt_python()
       == sys.executable)
 del os.environ["COMPANION_STT_PYTHON"]
 
+# R9/R10 claim 释放契约：inbox 落盘后经 on_stored 立即释放（exists
+# 接力去重），落盘前 OSError 则 finally 释放且回报 False 等重投——
+# 防 claim 在 body 长尾（多次 fsync 写）期间滞留 inbox 的回归。
+def _r9_body(session, msg, my_id, state, mid, path, on_stored=None):
+    _claim = os.path.join(B.INBOX, mid + ".claim")
+    check("R9a body 执行期间 claim 占位存在", os.path.exists(_claim))
+    on_stored()
+    check("R9b on_stored 后 claim 立即释放", not os.path.exists(_claim))
+
+
+_orig_body = B._process_inbound_body
+try:
+    B._process_inbound_body = _r9_body
+    _ok_r9 = B._process_inbound({}, {"message_id": "R9M", "message_type": 1,
+                                     "from_user_id": "u1"}, "u1")
+finally:
+    B._process_inbound_body = _orig_body
+check("R9c 正常处理返回 True 且无 claim 残留",
+      _ok_r9 is True
+      and not os.path.exists(os.path.join(B.INBOX, "R9M.claim")))
+
+
+def _r10_body(session, msg, my_id, state, mid, path, on_stored=None):
+    raise OSError("ENOSPC")
+
+
+try:
+    B._process_inbound_body = _r10_body
+    _ok_r10 = B._process_inbound({}, {"message_id": "R10M",
+                                      "message_type": 1,
+                                      "from_user_id": "u1"}, "u1")
+finally:
+    B._process_inbound_body = _orig_body
+check("R10 落盘前 OSError 返回 False 且 claim 已释放（可重投）",
+      _ok_r10 is False
+      and not os.path.exists(os.path.join(B.INBOX, "R10M.claim")))
+
 # ---------------- M：脚本工具 ----------------
 _ffmpeg = shutil.which("ffmpeg")
 if _ffmpeg:

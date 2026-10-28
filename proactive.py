@@ -169,6 +169,19 @@ def read_json(path, default=None):
     return data
 
 
+def _replace_retry(tmp, path):
+    # 与 bridge._replace_retry 同口径：Windows 瞬时锁（杀软扫描/并发
+    # 读者）下 os.replace 抛 PermissionError，短退避重试吸收窗口。
+    for attempt in range(10):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 9:
+                raise
+            time.sleep(0.03)
+
+
 def write_json(path, data):
     # tmp 名必须按写者唯一：固定 ".tmp" 时两个并发写者共用同一临时文件，
     # 一方的 os.replace 会把另一方的 tmp 抢走 → 对方 FileNotFoundError
@@ -185,7 +198,7 @@ def write_json(path, data):
         except OSError:
             pass
         raise
-    os.replace(tmp, path)
+    _replace_retry(tmp, path)
     if hasattr(os, "O_DIRECTORY"):  # 目录 fsync 仅 POSIX
         try:
             dfd = os.open(os.path.dirname(path) or ".", os.O_DIRECTORY)
