@@ -372,9 +372,12 @@ def _counting_fsync(fd):
 with mock.patch("os.fsync", _counting_fsync):
     B._prune_history()
 _hrows = read_jsonl(_hist)
+# fsync 次数按平台分流：文件 fsync 两平台都有；目录 fsync 是
+# POSIX 概念（bridge._fsync_dir 在无 O_DIRECTORY 的 Windows 上
+# 按设计跳过），故 Windows 期望 ≥1、POSIX 期望 ≥2。
 check("R5 _prune_history：旧行修剪 + 文件/目录 fsync + 无 tmp 残留",
       all(r.get("message_id") != "OLD1" for r in _hrows)
-      and _fsync_n["n"] >= 2
+      and _fsync_n["n"] >= (1 if os.name == "nt" else 2)
       and not os.path.exists(_hist + ".tmp"),
       f"fsync={_fsync_n['n']}")
 _low, _free = B.disk_space_low(STATE, warn_bytes=10 ** 18)
@@ -442,15 +445,22 @@ append_jsonl(_hist, {"ts": _now, "role": "user", "text": "看这张",
                      "kind": "reply", "message_id": "1001",
                      "media_file": "state/media_in/1001.jpg",
                      "img_desc": "一张江边照片"})
-_pr = subprocess.run(["bash",
-                      os.path.join(ROOT, "scripts", "prune_media_in.sh")],
-                     env=dict(os.environ, COMPANION_HOME=TMP),
-                     capture_output=True, text=True, timeout=120)
-check("M3 prune_media_in dry-run：整组报告、无留档保留、默认不删",
-      _pr.returncode == 0 and "1001.jpg" in _pr.stdout
-      and "1001.i2.jpg" in _pr.stdout and "1002" not in _pr.stdout
-      and os.path.exists(os.path.join(_mi, "1001.jpg")),
-      f"rc={_pr.returncode} out={_pr.stdout[:200]} err={_pr.stderr[:200]}")
+if os.name == "nt":
+    # prune_media_in.sh 是 POSIX 运维脚本（bash + 部署机清理），
+    # Windows 部署不走此脚本：按平台分流，只验脚本在册。
+    check("M3 prune_media_in dry-run：整组报告、无留档保留、默认不删"
+          "（Windows 分流：POSIX 运维脚本，只验在册）",
+          os.path.isfile(os.path.join(ROOT, "scripts", "prune_media_in.sh")))
+else:
+    _pr = subprocess.run(["bash",
+                          os.path.join(ROOT, "scripts", "prune_media_in.sh")],
+                         env=dict(os.environ, COMPANION_HOME=TMP),
+                         capture_output=True, text=True, timeout=120)
+    check("M3 prune_media_in dry-run：整组报告、无留档保留、默认不删",
+          _pr.returncode == 0 and "1001.jpg" in _pr.stdout
+          and "1001.i2.jpg" in _pr.stdout and "1002" not in _pr.stdout
+          and os.path.exists(os.path.join(_mi, "1001.jpg")),
+          f"rc={_pr.returncode} out={_pr.stdout[:200]} err={_pr.stderr[:200]}")
 
 # ---------------- CLI 冒烟 ----------------
 _cli_env = dict(os.environ, COMPANION_HOME=TMP)
