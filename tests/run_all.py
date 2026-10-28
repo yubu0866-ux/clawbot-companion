@@ -49,6 +49,7 @@ def main():
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONUTF8"] = "1"
     passed, failed = [], []
+    fail_detail = {}  # 失败套件 -> (失败行列表, 输出尾部)，供文末与 Step Summary 复用
     with tempfile.TemporaryDirectory() as logdir:
         for name in SUITES:
             if only and only not in name:
@@ -89,15 +90,45 @@ def main():
                     print(f"---- {name} 输出尾部 ----")
                     print("\n".join(tail))
                     print("----------------------")
+                    fail_detail[name] = (fails, tail)
                 except OSError:
-                    pass
+                    fail_detail[name] = ([], [])
                 failed.append(name)
     print()
     print(f"==== run_all: {len(passed)} 套通过 / {len(failed)} 套失败 ====")
     if failed:
         print("失败套件:" + " ".join(failed))
-        return 1
-    return 0
+    _write_step_summary(passed, failed, fail_detail)
+    return 1 if failed else 0
+
+
+def _write_step_summary(passed, failed, fail_detail):
+    """GitHub Actions Step Summary：CI 里 job 日志不易定位失败项时，
+    把逐套结果与失败套件的 FAIL 行/尾部写到 run 页的 Summary 区，
+    不开日志也能看到哪套、哪项挂了。仅当 GITHUB_STEP_SUMMARY 存在
+    （Actions 环境）时写，本地运行无副作用；写失败静默。"""
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"## selftest run_all：{len(passed)} 套通过 / "
+                    f"{len(failed)} 套失败\n\n")
+            for name in passed:
+                f.write(f"- ✅ {name}\n")
+            for name in failed:
+                f.write(f"- ❌ {name}\n")
+            for name in failed:
+                fails, tail = fail_detail.get(name, ([], []))
+                f.write(f"\n### ❌ {name}\n\n")
+                if fails:
+                    f.write("失败行：\n\n```\n" + "\n".join(fails)
+                            + "\n```\n\n")
+                if tail:
+                    f.write("输出尾部：\n\n```\n" + "\n".join(tail)
+                            + "\n```\n")
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":

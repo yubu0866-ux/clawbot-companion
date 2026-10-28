@@ -31,6 +31,7 @@
 - **outbox 毒值防阻塞**：待发条目关键字段为毒值（类型异常）时判死离队，不再让一条坏条目堵住整个队列。
 - `append_jsonl` 尾行无换行时先补行再追加，修半行拼行损坏后续所有行的问题。
 - **CI Windows 格 round28 平台语义适配**：R5 的 fsync 计数断言按平台分流（目录 fsync 是 POSIX 概念、Windows 按设计跳过，期望 ≥1；POSIX ≥2 不变）；M3 的 `prune_media_in.sh` dry-run 实跑断言限 POSIX（该脚本为 POSIX 运维工具），Windows 只验脚本在册。
+- **失败定位（run_all）**：在 GitHub Actions 环境下把逐套结果与失败套件的 FAIL 行/输出尾部写入 Step Summary（`GITHUB_STEP_SUMMARY`），run 页不开 job 日志也能定位哪套哪项失败；本地运行无副作用。
 
 ## 2026-10-27 — README 增加反馈入口
 
