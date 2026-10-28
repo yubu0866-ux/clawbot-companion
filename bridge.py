@@ -27,6 +27,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -288,6 +289,18 @@ def state_lock():
     return _StateLock()
 
 
+def _fsync_dir(dirpath):
+    """目录 fsync（仅 POSIX 有此概念，Windows 无 O_DIRECTORY 时跳过）。"""
+    if not hasattr(os, "O_DIRECTORY"):
+        return
+    try:
+        dfd = os.open(dirpath or ".", os.O_DIRECTORY)
+        os.fsync(dfd)
+        os.close(dfd)
+    except OSError:
+        pass
+
+
 def atomic_write_json(path, data, mode=0o644):
     tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
     try:
@@ -316,13 +329,7 @@ def atomic_write_json(path, data, mode=0o644):
         os.chmod(path, mode)
     except OSError:
         pass
-    if hasattr(os, "O_DIRECTORY"):  # 目录 fsync 仅 POSIX 有此概念
-        try:
-            dfd = os.open(os.path.dirname(path) or ".", os.O_DIRECTORY)
-            os.fsync(dfd)
-            os.close(dfd)
-        except OSError:
-            pass
+    _fsync_dir(os.path.dirname(path))
 
 
 def write_json_locked(path, data, mode=0o644):
@@ -330,23 +337,85 @@ def write_json_locked(path, data, mode=0o644):
         atomic_write_json(path, data, mode)
 
 
+def _quarantine_corrupt(path):
+    """损坏 state 文件留痕：改名为 <path>.corrupt-<unix秒> 保全原始字节
+    证据，返回留痕路径或 None。read_json 吞错回 default 后，下游常以空
+    数据写回同一路径——不先留痕，损坏原件会被静默覆盖清零、无从恢复
+    也无从定因。改名同时让原路径消失，后续读走 OSError 回 default，
+    不会反复触发。最佳努力：改名失败静默（留痕不许反噬主流程）。
+    同秒唯一命名：同文件同秒内再次损坏时基础名后加 -<pid>、再撞加
+    -2/-3…，不覆盖前一份证据。"""
+    try:
+        base = f"{path}.corrupt-{int(time.time())}"
+        dst = base
+        if os.path.exists(dst):
+            dst = f"{base}-{os.getpid()}"
+            n = 2
+            while os.path.exists(dst):
+                dst = f"{base}-{os.getpid()}-{n}"
+                n += 1
+        os.replace(path, dst)
+        return dst
+    except OSError:
+        return None
+
+
+def _is_outbox_path(path):
+    """outbox 三目录豁免留痕：pending/sent/failed 文件已有自己的死信
+    契约（发送趟 _move_with_error 移入 failed/）；留痕改名会抢在死信
+    之前把文件移走，破坏「损坏条判死」契约。state 文件仍留痕。"""
+    for d in (PENDING, SENT, FAILED):
+        if d and (path == d or path.startswith(d.rstrip(os.sep) + os.sep)):
+            return True
+    return False
+
+
 def read_json(path, default=None):
     # 只认 dict 顶层：本桥全部单文件 JSON 存储按构造都是对象；顶层是
-    # 裸标量/数组属损坏形态，透传会让下游 .get 消费者崩溃（bughunt2-
-    # 2026-10-25 实证 counters.json=5 时 get_unreplied AttributeError），
-    # 与解析失败同口径回 default。
+    # 裸标量/数组属损坏形态，透传会让下游 .get 消费者崩溃（实证：
+    # counters.json=5 时消费者 AttributeError），与解析失败同口径回
+    # default。解析失败/非对象顶层＝内容损坏：先留痕再回 default；
+    # 文件不存在等 OSError 是常态（首次运行），不留痕。例外：outbox
+    # 三目录文件不留痕（见 _is_outbox_path）。
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, ValueError):
+    except OSError:
         return default
-    return data if isinstance(data, dict) else default
+    except ValueError:
+        if not _is_outbox_path(path):
+            kept = _quarantine_corrupt(path)
+            if kept:
+                serve_log(f"state 文件损坏已留痕：{os.path.basename(path)} → "
+                          f"{os.path.basename(kept)}（回默认继续）")
+        return default
+    if not isinstance(data, dict):
+        if not _is_outbox_path(path):
+            kept = _quarantine_corrupt(path)
+            if kept:
+                serve_log(f"state 文件顶层非对象已留痕：{os.path.basename(path)}"
+                          f" → {os.path.basename(kept)}（回默认继续）")
+        return default
+    return data
 
 
 def append_jsonl(path, obj):
     with state_lock():
+        # 断电/崩溃可能留下无换行的半行：直接续写会与半行拼成一行、
+        # 两条记录一起被读层当坏行静默丢弃，追加前先查末字节、缺
+        # 换行先补一个。
+        prefix = ""
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                if f.tell() > 0:
+                    f.seek(-1, os.SEEK_END)
+                    if f.read(1) != b"\n":
+                        prefix = "\n"
+        except OSError:
+            pass
         with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            f.write(prefix + json.dumps(obj, ensure_ascii=False) + "\n")
             f.flush()
             os.fsync(f.fileno())
 
@@ -873,7 +942,11 @@ def _aes_ecb_decrypt(data, key):
 
 def _cdn_post(url, body, timeout=180):
     """POST 原始字节到微信 CDN，返回 (status, headers 小写键 dict)。
-    连接层异常与 HTTP 5xx 重试 3 次（退避 1s/2s/4s），与 http_request 一致。"""
+    连接层异常与 HTTP 5xx 重试 3 次（退避 1s/2s/4s），与 http_request 一致。
+    HTTP 错误时另把响应体前 4KB 的单行摘要放入 x-response-body：历史上
+    CDN 500 的 x-error-message 常为空，若再把响应体直接丢弃，日志只剩
+    裸 500、无从区分 CDN 源站/边缘与代理回包。只取响应体、不取 URL，
+    不落任何签名参数。"""
     last_exc = None
     for attempt in range(4):
         try:
@@ -883,11 +956,15 @@ def _cdn_post(url, body, timeout=180):
                 resp.read()
                 return resp.status, {k.lower(): v for k, v in resp.headers.items()}
         except urllib.error.HTTPError as e:
+            raw = b""
             try:
-                e.read()
+                raw = e.read(4096) or b""
             except Exception:
                 pass
             hdrs = {k.lower(): v for k, v in (e.headers.items() if e.headers else [])}
+            if raw:
+                hdrs["x-response-body"] = " ".join(
+                    raw.decode("utf-8", errors="replace").split())[:200]
             if 500 <= e.code < 600 and attempt < 3:
                 time.sleep([1, 2, 4][attempt])
                 continue
@@ -982,7 +1059,14 @@ def upload_media(session, to_user_id, file_path, kind, log=serve_log):
     status, hdrs = _cdn_post(cdn_url, ciphertext,
                              timeout=_media_io_timeout(len(ciphertext)))
     if status != 200:
-        msg = f"CDN 上传失败 HTTP {status}: {hdrs.get('x-error-message', '')[:200]}"
+        detail = (hdrs.get("x-error-message")
+                  or hdrs.get("x-response-body") or "")[:200]
+        extras = [f"{k}={str(hdrs[k])[:80]}"
+                  for k in ("server", "via", "x-cache")
+                  if hdrs.get(k)]
+        msg = f"CDN 上传失败 HTTP {status}: {detail}"
+        if extras:
+            msg += " (" + ", ".join(extras) + ")"
         if 500 <= status < 600:
             raise CdnServerError(msg, status)
         raise RuntimeError(msg)
@@ -1385,6 +1469,7 @@ def _receiver(session, state):
             pass
         if loop_n % 200 == 0:
             _prune_history()
+            _check_disk_space()
         if _needs_relogin():
             _stop.wait(60)
             continue
@@ -1424,21 +1509,36 @@ def _receiver(session, state):
         if resp.get("longpolling_timeout_ms"):
             longpoll_ms = int(resp["longpolling_timeout_ms"])
         msgs = resp.get("msgs") or []
+        batch_hold = False
         for msg in msgs:
             # 单条隔离：一条毒消息绝不许拖垮整批与 serve 本身（异常会让
             # 游标停在批前、同批被平台反复重投形成崩溃循环）。清洗层已
             # 在源头中和已知毒型，这里是未知毒型的最后防线：记日志留痕、
-            # 跳过本条、继续处理同批后续（bughunt-2026-10-24 面 4）
+            # 跳过本条、继续处理同批后续
             try:
-                _process_inbound(session, msg, my_id, state)
+                recorded = _process_inbound(session, msg, my_id, state)
             except Exception as e:
                 serve_log(f"入站单条处理异常已隔离 id={msg.get('message_id')}："
                           f"{type(e).__name__}: {e}")
-        # 先写 inbox（在 _process_inbound 内完成），再保存游标
+                recorded = True  # 内容毒型：跳过本条，游标照常推进防重投死循环
+            if recorded is False:
+                batch_hold = True  # 存储类落盘失败：本批游标不推进
+        # 先写 inbox（在 _process_inbound 内完成），再保存游标。本批有
+        # 消息因存储异常未落盘时，游标（内存与落盘）保持旧值，等平台
+        # 按旧游标重投整批——已落盘条目靠 message_id 去重吸收，绝不
+        # 让 ENOSPC 之类落盘失败变成永久丢消息。
         new_buf = resp.get("get_updates_buf")
-        if new_buf:
-            cursor = new_buf
-            write_json_locked(CURSOR_FILE, {"get_updates_buf": cursor, "updated_at": time.time()})
+        if new_buf and batch_hold:
+            serve_log("本批有入站消息落盘失败（存储异常），游标保持不推进，等待平台重投")
+        elif new_buf:
+            try:
+                write_json_locked(CURSOR_FILE, {"get_updates_buf": new_buf,
+                                                "updated_at": time.time()})
+                cursor = new_buf
+            except OSError as e:
+                # 游标自身落盘失败：消息已在 inbox 耐久落盘，保持旧
+                # 游标等重投（去重吸收），且不许打死接收线程。
+                serve_log(f"游标落盘失败（{type(e).__name__}: {e}），保持旧游标等待重投")
 
 
 def is_director_command(text, prefix="#"):
@@ -1566,6 +1666,24 @@ def _image_magic_ext(data):
     return None
 
 
+
+def _image_integrity_ok(data, ext):
+    """图片完整性（纯函数，供自检）：魔数只验头，截断文件照样过——
+    按格式验尾部结构：JPEG 须以 FFD9（EOI）结尾、PNG 须以 IEND 块
+    结尾、GIF 须以 0x3B 结尾、WebP 的 RIFF 声明长度须与实际一致。
+    任一不符判截断/损坏。"""
+    if ext == "jpg":
+        return len(data) >= 4 and data[-2:] == b"\xff\xd9"
+    if ext == "png":
+        return len(data) >= 12 and data[-8:-4] == b"IEND"
+    if ext == "gif":
+        return len(data) >= 2 and data[-1:] == b";"
+    if ext == "webp":
+        if len(data) < 12:
+            return False
+        return int.from_bytes(data[4:8], "little") + 8 == len(data)
+    return False
+
 def _inbound_media_key(media):
     """CDNMedia.aes_key 解码为 16 字节原始密钥：base64 解码得 16 字节，
     或 base64 里包着的 32 字符 hex 再解码。无可用密钥返回 None。"""
@@ -1602,127 +1720,230 @@ def _inbound_image_key(image_item):
     return _inbound_media_key(image_item.get("media"))
 
 
-def _fetch_inbound_image(msg, log=serve_log):
-    """同步下载解密消息里的第一张图片。返回 (media_file, media_cred)：
-    media_file 为相对 HOME 的路径（state/media_in/<message_id>.<ext>），
-    失败一律 (None, cred)；消息里没有图片 item 时 (None, None)。
-    media_cred 是凭证原文，仅供随 inbox 内部记录留存，绝不进日志/输出。"""
-    item = None
-    for it in msg.get("item_list") or []:
-        if isinstance(it, dict) and it.get("type") == 2 \
-                and isinstance(it.get("image_item"), dict):
-            item = it["image_item"]
-            break
-    if item is None:
-        return None, None
+_INBOUND_IMG_PER_MSG_MAX = 9  # 单条消息最多取 9 张图（微信多图条数口径）
+
+
+def _save_inbound_image(item, mid, suffix, log):
+    """下载解密单个图片 item 并落盘 state/media_in/<mid><suffix>.<ext>
+    （suffix 为 "" 或 ".i<n>"），字节即平台原图、桥侧不做任何缩放。
+    返回相对路径；任一步失败返回 None，失败类别只记日志、不记凭证值。"""
     media = item.get("media") or {}
-    cred = {"aeskey": item.get("aeskey"), "media": media}
-    mid = str(msg.get("message_id"))
+    tag = f"{mid}{suffix}"
     try:
         url = media.get("full_url") or ""
         if not url and media.get("encrypt_query_param"):
             url = (CDN_BASE_URL + "/download?encrypted_query_param="
                    + urllib.parse.quote(str(media["encrypt_query_param"]), safe=""))
         if not url:
-            log(f"入站图片降级 id={mid} 类别=无下载引用")
-            return None, cred
+            log(f"入站图片降级 id={tag} 类别=无下载引用")
+            return None
         try:
             status, raw = _cdn_get(url, timeout=_INBOUND_DL_TIMEOUT)
         except urllib.error.HTTPError as e:
-            log(f"入站图片降级 id={mid} 类别=HTTP {e.code}")
-            return None, cred
+            log(f"入站图片降级 id={tag} 类别=HTTP {e.code}")
+            return None
         except Exception as e:
-            log(f"入站图片降级 id={mid} 类别={'超时' if _is_timeout_exc(e) else '连接失败'}")
-            return None, cred
+            log(f"入站图片降级 id={tag} 类别={'超时' if _is_timeout_exc(e) else '连接失败'}")
+            return None
         if status != 200:
-            log(f"入站图片降级 id={mid} 类别=HTTP {status}")
-            return None, cred
+            log(f"入站图片降级 id={tag} 类别=HTTP {status}")
+            return None
         if len(raw) > _INBOUND_IMG_MAX:
-            log(f"入站图片降级 id={mid} 类别=超限 密文{len(raw)}字节")
-            return None, cred
+            log(f"入站图片降级 id={tag} 类别=超限 密文{len(raw)}字节")
+            return None
         key = _inbound_image_key(item)
         if key is not None:
             try:
                 data = _aes_ecb_decrypt(raw, key)
             except Exception:
-                log(f"入站图片降级 id={mid} 类别=解密失败")
-                return None, cred
+                log(f"入站图片降级 id={tag} 类别=解密失败")
+                return None
         else:
             data = raw
         ext = _image_magic_ext(data)
         os.makedirs(MEDIA_IN, exist_ok=True)
         if ext is None:
-            with open(os.path.join(MEDIA_IN, mid + ".bin"), "wb") as f:
+            with open(os.path.join(MEDIA_IN, mid + suffix + ".bin"), "wb") as f:
                 f.write(data)
-            log(f"入站图片降级 id={mid} 类别=格式未知（已存 .bin）")
-            return None, cred
-        with open(os.path.join(MEDIA_IN, mid + "." + ext), "wb") as f:
+            log(f"入站图片降级 id={tag} 类别=格式未知（已存 .bin）")
+            return None
+        if not _image_integrity_ok(data, ext):
+            # 截断/损坏：不落盘，交给上游降级＋延迟补取（一次为限），
+            # 不把坏图喂给回复轮次的读图。
+            log(f"入站图片降级 id={tag} 类别=完整性（{ext} 尾部结构不符，疑似截断）")
+            return None
+        with open(os.path.join(MEDIA_IN, mid + suffix + "." + ext), "wb") as f:
             f.write(data)
-        # 存储的相对路径一律用正斜杠：os.path.join 在 Windows 上产出反斜杠，
-        # 会打破 inbox/history 里 state/media_in/... 的既定口径（CI Windows 格
-        # T18a/T18c 实证）；正斜杠在 Windows 文件操作里同样合法。
-        return "state/media_in/" + mid + "." + ext, cred
+        # 存储的相对路径一律用正斜杠（Windows 上 os.path.join 产反斜杠，
+        # 会打破 inbox/history 的既定口径；正斜杠在 Windows 同样合法）。
+        return "state/media_in/" + mid + suffix + "." + ext
     except Exception as e:
-        log(f"入站图片降级 id={mid} 类别=异常 {type(e).__name__}")
-        return None, cred
+        log(f"入站图片降级 id={tag} 类别=异常 {type(e).__name__}")
+        return None
 
 
-# ---------------- 入站视频（第 2 批：下载解密 + ffmpeg 抽帧） ----------------
+def _fetch_inbound_images(msg, log=serve_log):
+    """同步下载解密消息里的全部图片（多图全收）。返回
+    (media_files, media_cred)：media_files 为相对 HOME 的路径列表
+    （首图 state/media_in/<message_id>.<ext>、其余 .i<n>.<ext>，顺序即
+    消息内顺序）；单张失败只跳过该张、其余照常；全失败为 []；消息里
+    没有图片 item 时 ([], None)。media_cred 顶层保留首图 aeskey/media
+    （旧口径），items 为逐图凭证列表，供延迟补取重建多图消息；
+    凭证仅供随 inbox 内部记录留存，绝不进日志/输出。"""
+    items = []
+    for it in msg.get("item_list") or []:
+        if isinstance(it, dict) and it.get("type") == 2 \
+                and isinstance(it.get("image_item"), dict):
+            items.append(it["image_item"])
+    if not items:
+        return [], None
+    mid = str(msg.get("message_id"))
+    cred = {"aeskey": items[0].get("aeskey"),
+            "media": items[0].get("media") or {},
+            "items": [{"aeskey": it.get("aeskey"),
+                       "media": it.get("media") or {}} for it in items]}
+    files = []
+    for idx, item in enumerate(items[:_INBOUND_IMG_PER_MSG_MAX]):
+        suffix = "" if idx == 0 else f".i{idx + 1}"
+        rel = _save_inbound_image(item, mid, suffix, log)
+        if rel:
+            files.append(rel)
+    if len(items) > _INBOUND_IMG_PER_MSG_MAX:
+        log(f"入站图片超量 id={mid} 共{len(items)}张 只取前{_INBOUND_IMG_PER_MSG_MAX}张")
+    return files, cred
+
+
+def _fetch_inbound_image(msg, log=serve_log):
+    """兼容包装：返回首图 (media_file, media_cred)，旧调用口径不变。
+    新代码请用 _fetch_inbound_images 取全部图片。"""
+    files, cred = _fetch_inbound_images(msg, log=log)
+    return (files[0] if files else None), cred
+
+
+# ---------------- 入站视频（下载解密 + 理解管线） ----------------
 # 字段口径（官方 Tencent/openclaw-weixin src/api/types.ts 的 VideoItem 与
-# src/media/media-download.ts 的 VIDEO 分支，2026-10-23 复核）：video_item
-# 没有 aeskey 字段，密钥只走 media.aes_key（base64）；media 为
+# src/media/media-download.ts 的 VIDEO 分支）：video_item 没有 aeskey
+# 字段，密钥只走 media.aes_key（base64）；media 为
 # CDNMedia{encrypt_query_param, aes_key, encrypt_type, full_url}，另有
 # video_size / play_length / video_md5 与 thumb_media（封面 CDN 引用，本桥
 # 不用，抽帧自带画面）。官方下载器对视频要求 media.aes_key 存在才下载，
-# 解密同为 AES-128-ECB + PKCS#7，落盘 video/mp4。本桥在此之上多做一步
-# ffmpeg 抽帧：帧图供回复轮次 muse.read 消费，理解口径与图片看图对齐。
-# 注意：真实视频样本为零，上述字段未经真实流量验证，验收靠用户实发。
+# 解密同为 AES-128-ECB + PKCS#7，落盘 video/mp4。本桥在此之上做理解管线：
+# ffprobe 元信息 + ffmpeg 抽帧（均匀点＋场景切换点）+ 音轨语音转写，汇成
+# 视频简报随记录留存，帧图供回复轮次读图消费、转写供生成层对上对方
+# 说了什么。理解是「抽帧＋转写」的近似，不是逐帧观看——状态如实降级、
+# 绝不假装看清听清（五档状态口径见转写节）。
 # 凭证只随 inbox 内部记录（video_cred）留存，日志只记失败类别、不记值；
-# 任一步失败都降级：记录不带 video_frames，她对视频走原兜底句。
+# 下载/解密/格式失败降级：记录不带 video_file；抽帧/转写失败各自降级
+# （无帧走兜底句、无转写只评画面）。
 
 _INBOUND_VID_MAX = 60 * 1024 * 1024  # 密文上限 60MB，超限降级
+_INBOUND_VID_FRAME_MAX = 8        # 帧数封顶（均匀 5 点＋场景切换点合并去重后）
+_VID_SCENE_MAX = 5                # 场景切换候选点上限
+_VID_SCENE_THRESHOLD = 0.35       # ffmpeg scene 分数阈值
+_VID_SCENE_DETECT_MAX_SEC = 600   # 超过此时长不再跑场景检测（整片解码太慢）
 
 
-def _extract_video_frames(mp4_abs, mid, log=serve_log):
-    """ffprobe 取时长，在约 5%/30%/55%/80%/95% 处抽最多 5 帧（宽 ≤720 的 JPEG）
-    存 MEDIA_IN/<mid>.f<n>.jpg，返回帧图相对路径列表（顺序即时间顺序）。
-    ffmpeg/ffprobe 缺失、时长未知或全部抽帧失败都返回 []（调用方降级）。"""
-    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-        log(f"入站视频抽帧跳过 id={mid} 类别=无ffmpeg")
+def _probe_video_meta(mp4_abs):
+    """ffprobe 一次取齐元信息 → {duration_sec, width, height, has_audio}；
+    探针失败返回 {}（调用方按缺失降级，不猜）。"""
+    if not shutil.which("ffprobe"):
+        return {}
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "format=duration:stream=codec_type,width,height",
+             "-of", "json", mp4_abs],
+            capture_output=True, timeout=30)
+        info = json.loads(proc.stdout.decode("utf-8", "replace") or "{}")
+    except Exception:
+        return {}
+    if not isinstance(info, dict):
+        return {}
+    meta = {}
+    try:
+        dur = float((info.get("format") or {}).get("duration"))
+        if dur > 0:
+            meta["duration_sec"] = round(dur, 1)
+    except (TypeError, ValueError):
+        pass
+    vwidth = vheight = 0
+    has_audio = False
+    for st in info.get("streams") or []:
+        if not isinstance(st, dict):
+            continue
+        if st.get("codec_type") == "video" and not vwidth:
+            try:
+                vwidth = int(st.get("width") or 0)
+                vheight = int(st.get("height") or 0)
+            except (TypeError, ValueError):
+                vwidth = vheight = 0
+        elif st.get("codec_type") == "audio":
+            has_audio = True
+    if not meta.get("duration_sec") and not vwidth:
+        return {}  # 时长与视频流都探不到：不是可读视频，按探针失败处理
+    if vwidth:
+        meta["width"] = vwidth
+        meta["height"] = vheight
+    meta["has_audio"] = has_audio
+    return meta
+
+
+def _video_scene_times(mp4_abs, duration):
+    """ffmpeg 场景切换检测 → 候选时刻（秒）：过滤首尾 0.3 秒内、相邻
+    间隔 ≥1 秒、最多 _VID_SCENE_MAX 个。ffmpeg 缺失/解析失败返回 []。"""
+    if not shutil.which("ffmpeg"):
         return []
     try:
         proc = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", mp4_abs],
-            capture_output=True, timeout=30)
-        duration = float(proc.stdout.decode("utf-8", "replace").strip())
+            ["ffmpeg", "-v", "info", "-i", mp4_abs,
+             "-vf", f"select='gt(scene,{_VID_SCENE_THRESHOLD})',showinfo",
+             "-f", "null", "-"],
+            capture_output=True, timeout=120)
+        text = proc.stderr.decode("utf-8", "replace")
     except Exception:
-        log(f"入站视频抽帧跳过 id={mid} 类别=时长未知")
         return []
+    times = []
+    for mobj in re.finditer(r"pts_time:\s*([0-9]+(?:\.[0-9]+)?)", text):
+        t = float(mobj.group(1))
+        if t <= 0.3 or t >= duration - 0.3:
+            continue
+        if times and t - times[-1] < 1.0:
+            continue
+        times.append(t)
+        if len(times) >= _VID_SCENE_MAX:
+            break
+    return times
+
+
+def _extract_video_frames(mp4_abs, mid, meta=None, log=serve_log):
+    """抽帧：均匀 5 点（约 5%/30%/55%/80%/95%）＋场景切换点合并、0.75 秒
+    内去重、按时间排序、封顶 _INBOUND_VID_FRAME_MAX 帧（宽 ≤720 的 JPEG）
+    存 MEDIA_IN/<mid>.f<n>.jpg，返回帧图相对路径列表（顺序即时间顺序）。
+    ffmpeg 缺失、时长未知或全部抽帧失败都返回 []（调用方降级）。"""
+    if not shutil.which("ffmpeg"):
+        log(f"入站视频抽帧跳过 id={mid} 类别=无ffmpeg")
+        return []
+    meta = meta or _probe_video_meta(mp4_abs)
+    duration = meta.get("duration_sec") or 0
     if not duration or duration <= 0:
         log(f"入站视频抽帧跳过 id={mid} 类别=时长未知")
         return []
     # 宽度口径：原宽 >720 才缩放（scale 的表达式写法在滤镜图里逗号会被当作
-    # 滤镜分隔符，故不用 min() 表达式，改为先探宽、只在需要时挂纯数值 scale）
-    vf = []
-    try:
-        proc = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width",
-             "-of", "default=noprint_wrappers=1:nokey=1", mp4_abs],
-            capture_output=True, timeout=30)
-        width = int(proc.stdout.decode("utf-8", "replace").strip().splitlines()[0])
-    except Exception:
-        width = 0
-    if width > 720:
-        vf = ["-vf", "scale=720:-2"]
-    frames = []
-    seen_ts = set()
-    for i, pct in enumerate((0.05, 0.30, 0.55, 0.80, 0.95), 1):
-        ts = round(duration * pct, 2)
-        if ts in seen_ts:
+    # 滤镜分隔符，故不用 min() 表达式，改为按已探宽度只在需要时挂纯数值 scale）
+    vf = ["-vf", "scale=720:-2"] if (meta.get("width") or 0) > 720 else []
+    times = [round(duration * p, 2) for p in (0.05, 0.30, 0.55, 0.80, 0.95)]
+    if duration <= _VID_SCENE_DETECT_MAX_SEC:
+        times += _video_scene_times(mp4_abs, duration)
+    picked = []
+    for t in sorted(times):
+        if picked and t - picked[-1] < 0.75:
             continue
-        seen_ts.add(ts)
+        picked.append(t)
+    if len(picked) > _INBOUND_VID_FRAME_MAX:
+        step = (len(picked) - 1) / (_INBOUND_VID_FRAME_MAX - 1)
+        picked = [picked[round(i * step)] for i in range(_INBOUND_VID_FRAME_MAX)]
+    frames = []
+    for i, ts in enumerate(picked, 1):
         out_abs = os.path.join(MEDIA_IN, f"{mid}.f{i}.jpg")
         try:
             proc = subprocess.run(
@@ -1748,12 +1969,289 @@ def _extract_video_frames(mp4_abs, mid, log=serve_log):
     return frames
 
 
+# ---------------- 入站视频语音转写 ----------------
+# 口径：ffmpeg 先把音轨解成 16kHz 单声道 wav，再由 STT 子进程把 PCM
+# 读成 numpy 数组喂 faster-whisper——按文件路径转写在部分 av 版本下
+# 必崩，不许改回路径输入。serve 本体不保证装有 faster-whisper，走子
+# 进程隔离。结果随 inbox/history 记录留存（video_transcript），不新增
+# 文件。状态如实降级：ok / partial（超长只转前段）/ no_audio（无音轨）/
+# no_speech（有音轨但无可辨人声，含纯音乐）/ failed（转写不可用）。
+# 部署：准备一个装有 faster-whisper 的 venv（如与桥同级的 stt-venv，
+# 或用户家目录 ~/stt-venv），或用环境变量 COMPANION_STT_PYTHON 指定
+# 解释器；模型缓存目录默认 ~/.cache/huggingface，已有 HF_HOME 时尊重之。
+
+def _resolve_stt_python():
+    """STT 解释器定位：env COMPANION_STT_PYTHON → 桥 HOME 同级
+    stt-venv → 用户家目录 ~/stt-venv → 当前解释器（其环境装有
+    faster-whisper 时）。serve 的运行身份与登录用户不同（如以 root
+    运行）时，只靠 expanduser("~") 会解析到错误家目录、venv 必然不
+    存在——故同级目录优先。子路径按平台取（POSIX bin/python、
+    Windows Scripts/python.exe）。"""
+    env = os.environ.get("COMPANION_STT_PYTHON")
+    if env:
+        return env
+    sub = "Scripts" if os.name == "nt" else "bin"
+    exe = "python.exe" if os.name == "nt" else "python"
+    sib = os.path.join(os.path.dirname(HOME), "stt-venv", sub, exe)
+    if os.path.exists(sib):
+        return sib
+    home_v = os.path.join(os.path.expanduser("~"), "stt-venv", sub, exe)
+    if os.path.exists(home_v):
+        return home_v
+    try:
+        import importlib.util
+        if importlib.util.find_spec("faster_whisper") is not None:
+            return sys.executable
+    except Exception:
+        pass
+    return home_v  # 不存在 → 前置判定按「无 stt 环境」如实降级
+
+
+_STT_PYTHON = _resolve_stt_python()
+
+
+def _stt_child_env():
+    """转写子进程环境：serve 以无 HOME 或异身份运行（如 systemd 以
+    root 运行）时，faster-whisper 默认模型缓存会落到错误家目录
+    （模型不在那里、甚至落在易失盘上）。env 已有 HF_HOME 时尊重之；
+    否则用户家目录缓存真实存在才注入。"""
+    env = dict(os.environ)
+    if not env.get("HF_HOME"):
+        cand = os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
+        if os.path.isdir(cand):
+            env["HF_HOME"] = cand
+    return env
+
+
+def _stt_setting(key, default):
+    """config 的 stt 节读取（model/language），缺失或非法回默认。"""
+    try:
+        v = (cfg().get("stt") or {}).get(key)
+    except Exception:
+        v = None
+    return v if isinstance(v, str) and v else default
+
+
+_VID_TRANSCRIBE_MAX_SEC = 180    # 只转写前 180 秒音频
+_VID_TRANSCRIBE_TIMEOUT = 180    # 转写子进程超时（秒）
+_VID_TRANSCRIPT_MAX_CHARS = 1500
+
+_VID_WHISPER_CHILD = (
+    "import json,sys,wave\n"
+    "import numpy as np\n"
+    "from faster_whisper import WhisperModel\n"
+    "with wave.open(sys.argv[1], 'rb') as w:\n"
+    "    raw = w.readframes(w.getnframes())\n"
+    "x = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0\n"
+    "m = WhisperModel(sys.argv[3], device='cpu', compute_type='int8')\n"
+    "segs, _info = m.transcribe(x, language=sys.argv[2], vad_filter=True)\n"
+    "out = [{'text': s.text, 'nsp': round(float(s.no_speech_prob), 3),"
+    " 'alp': round(float(s.avg_logprob), 3)} for s in segs]\n"
+    "print(json.dumps(out, ensure_ascii=False))\n"
+)
+
+
+def _transcribe_video(mp4_abs, meta, log=serve_log, lang=None):
+    """转写视频里的人声 → (transcript, status)。任一步失败都返回
+    ('', 类别) 并记日志类别，绝不抛异常打断收件；转写文本不进日志。
+    meta 为空（探针失败）报 failed、无音轨报 no_audio，两者不混。"""
+    mid = os.path.basename(mp4_abs)
+    if not meta:
+        return "", "failed"
+    if not meta.get("has_audio"):
+        return "", "no_audio"
+    if not shutil.which("ffmpeg"):
+        return "", "failed"
+    if not os.path.exists(_STT_PYTHON):
+        log(f"入站视频转写跳过 id={mid} 类别=无stt环境")
+        return "", "failed"
+    lang = lang or _stt_setting("language", "zh")
+    model = _stt_setting("model", "base")
+    duration = float(meta.get("duration_sec") or 0)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            wav = os.path.join(td, "audio.wav")
+            proc = subprocess.run(
+                ["ffmpeg", "-v", "error", "-i", mp4_abs,
+                 "-t", str(_VID_TRANSCRIBE_MAX_SEC),
+                 "-vn", "-ac", "1", "-ar", "16000", "-y", wav],
+                capture_output=True, timeout=60)
+            if proc.returncode != 0 or not os.path.exists(wav):
+                log(f"入站视频转写失败 id={mid} 类别=音轨提取失败")
+                return "", "failed"
+            try:
+                proc = subprocess.run(
+                    [_STT_PYTHON, "-c", _VID_WHISPER_CHILD, wav, lang, model],
+                    capture_output=True, timeout=_VID_TRANSCRIBE_TIMEOUT,
+                    env=_stt_child_env())
+            except subprocess.TimeoutExpired:
+                log(f"入站视频转写失败 id={mid} 类别=超时")
+                return "", "failed"
+            if proc.returncode != 0:
+                log(f"入站视频转写失败 id={mid} 类别=子进程异常")
+                return "", "failed"
+            segs = json.loads(
+                proc.stdout.decode("utf-8", "replace").strip().splitlines()[-1])
+    except Exception as e:
+        log(f"入站视频转写失败 id={mid} 类别=异常 {type(e).__name__}")
+        return "", "failed"
+    if not isinstance(segs, list):
+        return "", "failed"
+    parts = []
+    for s in segs:
+        if not isinstance(s, dict):
+            continue
+        try:
+            nsp = float(s.get("nsp", 0))
+            alp = float(s.get("alp", 0))
+        except (TypeError, ValueError):
+            continue
+        if nsp >= 0.6 or alp <= -1.0:
+            continue  # 无人声概率高/置信过低的段不算人声（纯音乐防幻觉）
+        t = str(s.get("text", "")).strip()
+        if t:
+            parts.append(t)
+    text = "".join(parts).strip()
+    if not text:
+        return "", "no_speech"
+    status = "partial" if duration > _VID_TRANSCRIBE_MAX_SEC else "ok"
+    return text[:_VID_TRANSCRIPT_MAX_CHARS], status
+
+
+# ---------------- 入站视频转写异步化 ----------------
+# 收件只做前置判定：终局状态（探针失败/无音轨/无 ffmpeg/无 stt
+# 环境）当场定性；可转写的落 pending 起后台线程，转写就绪后回填
+# 原记录并（有文本时）写补达记录触发补评。取舍：生成层先按画面
+# 及时回应、语音内容随后补达合并——不让整轮干等 whisper 最坏
+# 180s，也不退回「没听清装听懂」：pending 期间口径就是只评画面
+# 不编台词。whisper 子进程以信号量串行，防多视频并发吃满 CPU。
+# 进程重启会打断在途线程，由启动补扫重新排队（回填幂等）。
+
+_TRANSCRIBE_SEM = threading.Semaphore(1)
+
+
+def _transcribe_precheck(mp4_abs, meta, log=serve_log):
+    """转写前置判定：返回 None＝可转写（走异步 pending）；否则返回
+    终局状态串（failed/no_audio）。与 _transcribe_video 的前置口径
+    一致（那边保留全套判定供同步直调与自检）。"""
+    if not meta:
+        return "failed"
+    if not meta.get("has_audio"):
+        return "no_audio"
+    if not shutil.which("ffmpeg"):
+        return "failed"
+    if not os.path.exists(_STT_PYTHON):
+        log(f"入站视频转写跳过 id={os.path.basename(mp4_abs)} 类别=无stt环境")
+        return "failed"
+    return None
+
+
+def _spawn_transcribe(mp4_abs, mid, meta, log=serve_log):
+    """起后台转写线程。线程内异常全吞＋记日志类别，绝不影响收件。"""
+    def _run():
+        with _TRANSCRIBE_SEM:
+            try:
+                text, status = _transcribe_video(mp4_abs, meta, log=log)
+            except Exception as e:
+                log(f"入站视频转写线程异常 id={mid}：{type(e).__name__}")
+                return
+            try:
+                _apply_transcript_ready(mid, text, status, log=log)
+            except Exception as e:
+                log(f"入站视频转写回填异常 id={mid}：{type(e).__name__}")
+
+    threading.Thread(target=_run, daemon=True,
+                     name=f"vid-transcribe-{mid}").start()
+
+
+def _apply_transcript_ready(mid, transcript, status, log=serve_log):
+    """转写就绪回填（仿 _apply_inbound_refetch 模式）：原 inbox 记录
+    就地更新转写字段；有可用转写文本时另写一条 video_transcript
+    补达记录并触发 worker——原轮次可能已按画面回复过，这条让生成层
+    拿到对方说的话后补评内容；原轮次尚未回复时两条同批领取、合并
+    理解。无文本的终局状态只回填、不打扰。补达记录已存在则跳过
+    （重复完成/补扫重排幂等）。"""
+    mid = str(mid)
+    path = os.path.join(INBOX, mid + ".json")
+    rec = read_json(path, None)
+    if not isinstance(rec, dict):
+        return
+    rec["video_transcript"] = transcript
+    rec["video_transcript_status"] = status
+    write_json_locked(path, rec)
+    if not transcript:
+        log(f"入站视频转写完成 id={mid} 状态={status}（无文本，仅回填）")
+        return
+    note_path = os.path.join(INBOX, mid + "-transcript.json")
+    if os.path.exists(note_path):
+        return
+    note = {"message_id": mid + "-transcript", "ref_message_id": mid,
+            "type": "video_transcript", "text": "",
+            "received_at": time.time(),
+            "from_user_id": rec.get("from_user_id"),
+            "context_token": rec.get("context_token"),
+            "create_time_ms": rec.get("create_time_ms"),
+            "video_file": rec.get("video_file"),
+            "video_frames": rec.get("video_frames"),
+            "video_meta": rec.get("video_meta"),
+            "video_transcript": transcript,
+            "video_transcript_status": status}
+    write_json_locked(note_path, note)
+    append_jsonl(HISTORY_FILE,
+                 {"ts": time.time(), "role": "user", "message_id": mid,
+                  "type": "video_transcript",
+                  "video_transcript": transcript,
+                  "video_transcript_status": status})
+    log(f"入站视频转写完成 id={mid} 状态={status}，已写补达记录")
+    touch_trigger_and_spawn_worker()
+
+
+def _transcript_pending_sweep(log=serve_log):
+    """serve 启动补扫：进程重启打断在途转写线程会让记录永停
+    pending——启动时把 24h 内仍 pending、mp4 还在、至多 3 条重新
+    排队转写。返回重排条数。"""
+    n = 0
+    try:
+        names = sorted(os.listdir(INBOX))
+    except OSError:
+        return 0
+    for name in names:
+        if n >= 3:
+            break
+        if not name.endswith(".json") or not name[:-5].isdigit():
+            continue
+        rec = read_json(os.path.join(INBOX, name), None)
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("video_transcript_status") != "pending":
+            continue
+        if time.time() - float(rec.get("received_at") or 0) > 86400:
+            continue
+        vf = rec.get("video_file")
+        if not vf:
+            continue
+        mp4_abs = os.path.join(HOME, vf)
+        if not os.path.exists(mp4_abs):
+            continue
+        meta = rec.get("video_meta") or {}
+        if _transcribe_precheck(mp4_abs, meta, log=log) is None:
+            _spawn_transcribe(mp4_abs, str(rec.get("message_id")), meta,
+                              log=log)
+            n += 1
+    if n:
+        log(f"serve 启动补扫：{n} 条 pending 视频转写已重新排队")
+    return n
+
+
 def _fetch_inbound_video(msg, log=serve_log):
-    """同步下载解密消息里的第一个视频并抽帧。返回 (video_file, frames, cred)：
-    video_file 为相对 HOME 的 mp4 路径（state/media_in/<message_id>.mp4），
-    frames 为帧图相对路径列表（可为 []：mp4 已落盘但无帧，按兜底处理）；
-    下载/解密/格式任一失败一律 (None, None, cred)；消息里没有视频 item 时
-    (None, None, None)。cred 是凭证原文，仅供随 inbox 内部记录留存。"""
+    """同步下载解密消息里的第一个视频并跑理解管线。返回
+    (video_file, frames, cred, vinfo)：video_file 为相对 HOME 的 mp4
+    路径（state/media_in/<message_id>.mp4），frames 为帧图相对路径列表
+    （可为 []：mp4 已落盘但无帧，按兜底处理）；vinfo 为视频简报原料
+    {"meta": 元信息, "transcript": 转写文本, "transcript_status": 状态}。
+    下载/解密/格式任一失败一律 (None, None, cred, None)；消息里没有
+    视频 item 时 (None, None, None, None)。cred 是凭证原文，仅供随
+    inbox 内部记录留存。"""
     item = None
     for it in msg.get("item_list") or []:
         if isinstance(it, dict) and it.get("type") == 5 \
@@ -1761,7 +2259,7 @@ def _fetch_inbound_video(msg, log=serve_log):
             item = it["video_item"]
             break
     if item is None:
-        return None, None, None
+        return None, None, None, None
     media = item.get("media") or {}
     cred = {"media": media}
     mid = str(msg.get("message_id"))
@@ -1772,48 +2270,78 @@ def _fetch_inbound_video(msg, log=serve_log):
                    + urllib.parse.quote(str(media["encrypt_query_param"]), safe=""))
         if not url:
             log(f"入站视频降级 id={mid} 类别=无下载引用")
-            return None, None, cred
+            return None, None, cred, None
         key = _inbound_media_key(media)
         if key is None:
             # 官方下载器口径：视频必须有 media.aes_key 才下载，不做明文猜测
             log(f"入站视频降级 id={mid} 类别=无密钥")
-            return None, None, cred
+            return None, None, cred, None
         est = item.get("video_size")
         est = est if isinstance(est, int) and est > 0 else 8_000_000
         try:
             status, raw = _cdn_get(url, timeout=_media_io_timeout(est))
         except urllib.error.HTTPError as e:
             log(f"入站视频降级 id={mid} 类别=HTTP {e.code}")
-            return None, None, cred
+            return None, None, cred, None
         except Exception as e:
             log(f"入站视频降级 id={mid} 类别={'超时' if _is_timeout_exc(e) else '连接失败'}")
-            return None, None, cred
+            return None, None, cred, None
         if status != 200:
             log(f"入站视频降级 id={mid} 类别=HTTP {status}")
-            return None, None, cred
+            return None, None, cred, None
         if len(raw) > _INBOUND_VID_MAX:
             log(f"入站视频降级 id={mid} 类别=超限 密文{len(raw)}字节")
-            return None, None, cred
+            return None, None, cred, None
         try:
             data = _aes_ecb_decrypt(raw, key)
         except Exception:
             log(f"入站视频降级 id={mid} 类别=解密失败")
-            return None, None, cred
+            return None, None, cred, None
         if len(data) < 8 or data[4:8] != b"ftyp":
             log(f"入站视频降级 id={mid} 类别=格式未知")
-            return None, None, cred
+            return None, None, cred, None
+        want_md5 = str(item.get("video_md5") or "").strip().lower()
+        if len(want_md5) == 32 and all(c in "0123456789abcdef" for c in want_md5):
+            # 平台声明的明文 md5：不符即截断/错件，降级不落盘。字段
+            # 缺失或非标准形态时不判（不因字段口径差异误杀正常视频）。
+            if hashlib.md5(data).hexdigest() != want_md5:
+                log(f"入站视频降级 id={mid} 类别=完整性（video_md5 不符）")
+                return None, None, cred, None
         os.makedirs(MEDIA_IN, exist_ok=True)
         mp4_abs = os.path.join(MEDIA_IN, mid + ".mp4")
         with open(mp4_abs, "wb") as f:
             f.write(data)
         video_rel = "state/media_in/" + mid + ".mp4"  # 存储路径正斜杠，见图片侧同款说明
-        frames = _extract_video_frames(mp4_abs, mid, log=log)
+        meta = _probe_video_meta(mp4_abs)
+        if not meta and shutil.which("ffprobe"):
+            # ffprobe 在场却探不到时长与视频流：文件截断/损坏，删件
+            # 降级，不把坏 mp4 喂给理解管线充数（ffprobe 缺失时不判，
+            # 属环境限制而非文件问题）。
+            try:
+                os.remove(mp4_abs)
+            except OSError:
+                pass
+            log(f"入站视频降级 id={mid} 类别=完整性（探针无元信息）")
+            return None, None, cred, None
+        frames = _extract_video_frames(mp4_abs, mid, meta=meta, log=log)
         if not frames:
             log(f"入站视频降级 id={mid} 类别=抽帧失败（mp4 已落盘、无帧图）")
-        return video_rel, frames, cred
+        # 转写异步化：同步等 whisper 最坏 180s 会堵住收件线程、拖慢
+        # 该轮回复启动。可转写的先落 pending 并起后台线程，转写就绪
+        # 后 _apply_transcript_ready 回填＋补达；终局状态（无音轨等）
+        # 当场定性，不起线程。
+        pre = _transcribe_precheck(mp4_abs, meta, log=log)
+        if pre is None:
+            transcript, tstatus = "", "pending"
+            _spawn_transcribe(mp4_abs, mid, meta, log=log)
+        else:
+            transcript, tstatus = "", pre
+        vinfo = {"meta": meta, "transcript": transcript,
+                 "transcript_status": tstatus}
+        return video_rel, frames, cred, vinfo
     except Exception as e:
         log(f"入站视频降级 id={mid} 类别=异常 {type(e).__name__}")
-        return None, None, cred
+        return None, None, cred, None
 
 
 _INBOUND_REFETCH_DELAY_SEC = 180  # 入站补取延迟：避开瞬时网络抖动窗口，又不至于让她等太久
@@ -1855,7 +2383,8 @@ def _schedule_inbound_refetch(mid, kind, cred, log=serve_log):
     return True
 
 
-def _apply_inbound_refetch(mid, kind, media_file, video_file, frames, log):
+def _apply_inbound_refetch(mid, kind, media_files, video_file, frames,
+                           vinfo, log):
     """补取成功回填：原 inbox 记录补媒体字段备查；另写一条
     media_refetch 提示记录（原轮次可能已回复，这条让 worker 有机会
     补看补评）并触发 worker；history 同步补记。"""
@@ -1863,15 +2392,25 @@ def _apply_inbound_refetch(mid, kind, media_file, video_file, frames, log):
             "type": "media_refetch", "text": "", "received_at": time.time()}
     hist = {"ts": time.time(), "role": "user", "message_id": mid,
             "type": "media_refetch"}
-    for key, val in (("media_file", media_file), ("video_file", video_file),
-                     ("video_frames", frames)):
+    media_file = media_files[0] if media_files else None
+    for key, val in (("media_file", media_file), ("media_files", media_files),
+                     ("video_file", video_file), ("video_frames", frames)):
         if val:
             note[key] = val
             hist[key] = val
+    if vinfo:
+        for key, val in (("video_meta", vinfo.get("meta")),
+                         ("video_transcript", vinfo.get("transcript")),
+                         ("video_transcript_status",
+                          vinfo.get("transcript_status"))):
+            if val:
+                note[key] = val
+                hist[key] = val
     path = os.path.join(INBOX, mid + ".json")
     rec = read_json(path, None)
     if isinstance(rec, dict):
-        for key in ("media_file", "video_file", "video_frames"):
+        for key in ("media_file", "media_files", "video_file", "video_frames",
+                    "video_meta", "video_transcript", "video_transcript_status"):
             if key in note:
                 rec[key] = note[key]
         rec["refetched_at"] = time.time()
@@ -1886,7 +2425,7 @@ def _apply_inbound_refetch(mid, kind, media_file, video_file, frames, log):
 
 
 def _inbound_refetch_sweep(log=serve_log):
-    """延迟补取清扫（节流 15s）：到期条目按 cred 重建单媒体消息重走
+    """延迟补取清扫（节流 15s）：到期条目按 cred 重建媒体消息重走
     下载函数，一次为限。条目先出队再尝试——崩溃/失败都不重复补取；
     放弃时留日志痕迹可查。"""
     now = time.time()
@@ -1904,48 +2443,62 @@ def _inbound_refetch_sweep(log=serve_log):
         atomic_write_json(INBOUND_RETRY_FILE, {"entries": rest})
     for e in due:
         mid, kind, cred = str(e.get("message_id")), e.get("kind"), e.get("cred") or {}
-        media_file = video_file = frames = None
+        media_files = []
+        video_file = frames = vinfo = None
         try:
             if kind == "image":
-                item = {"type": 2, "image_item": {
-                    "aeskey": cred.get("aeskey"), "media": cred.get("media") or {}}}
-                media_file, _ = _fetch_inbound_image(
-                    {"message_id": mid, "item_list": [item]}, log=log)
+                # 多图口径：cred.items 逐图重建整条消息；旧队列条目
+                # 只有顶层 aeskey/media 时按单图重建
+                item_creds = cred.get("items") or [
+                    {"aeskey": cred.get("aeskey"),
+                     "media": cred.get("media") or {}}]
+                item_list = [{"type": 2, "image_item": {
+                    "aeskey": c.get("aeskey"), "media": c.get("media") or {}}}
+                    for c in item_creds if isinstance(c, dict)]
+                media_files, _ = _fetch_inbound_images(
+                    {"message_id": mid, "item_list": item_list}, log=log)
             elif kind == "video":
                 item = {"type": 5, "video_item": {"media": cred.get("media") or {}}}
-                video_file, frames, _ = _fetch_inbound_video(
+                video_file, frames, _, vinfo = _fetch_inbound_video(
                     {"message_id": mid, "item_list": [item]}, log=log)
         except Exception as exc:
             log(f"入站补取异常 id={mid} kind={kind}：{type(exc).__name__}")
             continue
-        if not (media_file or video_file):
+        if not (media_files or video_file):
             log(f"入站补取失败（一次为限，放弃）id={mid} kind={kind}")
             continue
-        _apply_inbound_refetch(mid, kind, media_file, video_file, frames, log)
+        _apply_inbound_refetch(mid, kind, media_files, video_file, frames,
+                               vinfo, log)
 
 
 def _process_inbound(session, msg, my_id, state=None):
+    """入站单条处理。返回值：True＝本条已耐久落盘或本就不需落盘
+    （过滤/撤回/去重命中），接收游标可推进；False＝落盘因存储类
+    异常（OSError，如 ENOSPC）失败——游标必须保持不推进、等平台
+    按旧游标重投整批，已落盘条目靠 message_id 去重吸收。非存储类
+    异常照旧上抛，由接收循环的单条隔离处理（内容毒型跳过本条、
+    游标照常推进，防同批反复重投的死循环）。"""
     if msg.get("message_id") is None:
-        return
+        return True
     mid = str(msg["message_id"])
     if _handle_recall(msg):
-        return
+        return True
     # 过滤：message_type==1、本人发送、无 group_id，三条都满足才收
     if msg.get("message_type") != 1:
-        return
+        return True
     if msg.get("group_id"):
-        return
+        return True
     if my_id and msg.get("from_user_id") != my_id:
-        return
+        return True
     path = os.path.join(INBOX, mid + ".json")
     if os.path.exists(path):
-        return  # 按 message_id 去重
-    # 并发去重 claim（第五轮线1压测实证）：原 exists 检查与下方落盘之间
-    # 隔着分类/媒体下载长窗口，多线程/多进程并发重投同一 message_id 时
-    # 全部穿过检查、history 重复落账（8 线程实测 4 条）。改用 O_EXCL
-    # 原子 claim 文件占位（*.claim 不入 worker/status 的 *.json 扫描）：
-    # 抢不到 claim 即已有同 id 在处理，直接返回；处理结束（成功落盘后
-    # 由 exists 接力去重、异常时允许重投）在 finally 中释放 claim。
+        return True  # 按 message_id 去重
+    # 并发去重 claim（压测实证）：原 exists 检查与下方落盘之间隔着
+    # 分类/媒体下载长窗口，多线程/多进程并发重投同一 message_id 时
+    # 全部穿过检查、history 重复落账。改用 O_EXCL 原子 claim 文件
+    # 占位（*.claim 不入 worker/status 的 *.json 扫描）：抢不到
+    # claim 即已有同 id 在处理，直接返回；处理结束（成功落盘后由
+    # exists 接力去重、异常时允许重投）在 finally 中释放 claim。
     claim_path = os.path.join(INBOX, mid + ".claim")
     claimed = False
     try:
@@ -1953,17 +2506,23 @@ def _process_inbound(session, msg, my_id, state=None):
         os.close(_cfd)
         claimed = True
     except FileExistsError:
-        return
+        return True  # 同 id 已在处理：由对方的结果负责，本条不重复落盘
     except OSError:
         pass  # claim 落盘失败（只读 fs 等）：退回 exists-only 旧口径，不阻断收件
     try:
         _process_inbound_body(session, msg, my_id, state, mid, path)
+    except OSError:
+        # 落盘链存储类失败（ENOSPC 等）：消息未耐久落盘，回报接收
+        # 循环保持游标、等平台重投；claim 在 finally 释放，重投可
+        # 重新领取本条。
+        return False
     finally:
         if claimed:
             try:
                 os.remove(claim_path)
             except OSError:
                 pass
+    return True
 
 
 def _process_inbound_body(session, msg, my_id, state, mid, path):
@@ -1997,13 +2556,16 @@ def _process_inbound_body(session, msg, my_id, state, mid, path):
         serve_log(f"导演指令已分流 id={mid} text={text[:40]!r}")
         touch_trigger_and_spawn_worker()
         return
-    # 入站图片（第 1 步）：同步下载解密落盘；失败降级为无 media_file，流程不变
-    media_file, media_cred = _fetch_inbound_image(msg)
+    # 入站图片：同步下载解密落盘（多图全收）；失败降级为无 media_file，
+    # 流程不变。media_file 保留首图旧口径，media_files 为全部图片。
+    media_files, media_cred = _fetch_inbound_images(msg)
+    media_file = media_files[0] if media_files else None
     if not media_file and media_cred:
-        # 台账 #15/#26（选项 3）：首次失败且 cred 可用 → 登记一次延迟补取
+        # 首次失败且 cred 可用 → 登记一次延迟补取
         _schedule_inbound_refetch(mid, "image", media_cred)
-    # 入站视频（第 2 批）：同步下载解密落盘 + 抽帧；失败降级为无 video_frames
-    video_file, video_frames, video_cred = _fetch_inbound_video(msg)
+    # 入站视频：同步下载解密落盘 + 元信息 + 抽帧 + 语音转写（异步）；
+    # 失败降级为无 video_file/video_frames
+    video_file, video_frames, video_cred, video_info = _fetch_inbound_video(msg)
     if not video_file and video_cred:
         _schedule_inbound_refetch(mid, "video", video_cred)
     rec = {"message_id": mid, "from_user_id": from_uid,
@@ -2012,12 +2574,18 @@ def _process_inbound_body(session, msg, my_id, state, mid, path):
            "ref_text": ref_text, "recalled": bool(msg.get("delete_time_ms"))}
     if media_file:
         rec["media_file"] = media_file
+    if media_files:
+        rec["media_files"] = media_files
     if media_cred:
         rec["media_cred"] = media_cred  # 凭证只随 inbox 内部记录留存，不进 history/日志
     if video_file:
         rec["video_file"] = video_file
     if video_frames:
         rec["video_frames"] = video_frames
+    if video_info:
+        rec["video_meta"] = video_info.get("meta") or {}
+        rec["video_transcript"] = video_info.get("transcript") or ""
+        rec["video_transcript_status"] = video_info.get("transcript_status") or ""
     if video_cred:
         rec["video_cred"] = video_cred  # 同 media_cred 口径：只随 inbox 记录留存
     write_json_locked(path, rec)
@@ -2028,10 +2596,17 @@ def _process_inbound_body(session, msg, my_id, state, mid, path):
                 "type": typ, "text": text}
     if media_file:
         hist_rec["media_file"] = media_file
+    if media_files:
+        hist_rec["media_files"] = media_files
     if video_file:
         hist_rec["video_file"] = video_file
     if video_frames:
         hist_rec["video_frames"] = video_frames
+    if video_info:
+        hist_rec["video_meta"] = video_info.get("meta") or {}
+        hist_rec["video_transcript"] = video_info.get("transcript") or ""
+        hist_rec["video_transcript_status"] = \
+            video_info.get("transcript_status") or ""
     append_jsonl(HISTORY_FILE, hist_rec)
     set_unreplied(0)
     with state_lock():
@@ -2051,6 +2626,30 @@ def _process_inbound_body(session, msg, my_id, state, mid, path):
     except Exception:
         pass
     touch_trigger_and_spawn_worker()
+
+
+DISK_FREE_WARN_BYTES = 500 * 1024 * 1024  # state 所在盘可用低于此值告警
+
+
+def disk_space_low(path, warn_bytes=DISK_FREE_WARN_BYTES):
+    """磁盘余量监测（纯查询，供自检）：返回 (是否偏低, 可用字节)；
+    查询失败返回 (False, None)——监测本身不许反噬主流程。"""
+    try:
+        free = shutil.disk_usage(path).free
+    except OSError:
+        return False, None
+    return free < warn_bytes, free
+
+
+def _check_disk_space():
+    try:
+        low, free = disk_space_low(STATE)
+        if low:
+            serve_log(f"磁盘余量告警：state 所在盘可用仅 {free / 1048576:.0f}MB"
+                      f"（阈值 {DISK_FREE_WARN_BYTES // 1048576}MB），"
+                      f"落盘失败风险上升（ENOSPC 时游标保持不推进、等平台重投）")
+    except Exception:
+        pass
 
 
 def _prune_history():
@@ -2073,7 +2672,12 @@ def _prune_history():
             with open(tmp, "w", encoding="utf-8") as f:
                 for r in kept:
                     f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                # fsync 对齐 atomic_write_json：原实现写完直接 replace，
+                # 断电时已修剪内容可能未落盘。
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, HISTORY_FILE)
+            _fsync_dir(os.path.dirname(HISTORY_FILE))
 
 
 # ---------------- serve：发送线程 ----------------
@@ -2145,15 +2749,75 @@ def _proactive_failure_marks_stale(data, exc, code):
     return True
 
 
+# reply 组 token 失效整组止损：一条回复发送时若平台以业务错误明确
+# 拒绝（context/token 失效类），同组（同 message_id）其余条目共用同一
+# token——逐条再试只是逐条撞同一堵墙、逐条刷失败噪声，还可能把同组
+# 后半段拖过 context 新鲜期。判定保守口径：-3 是生产健康日志里实测
+# 过的发送业务码，列入已知码集；其余业务码须 errmsg 命中 context/
+# token 失效语义才触发，未知业务码保持逐条处置原口径。-14 走登录
+# 过期通路（整趟已 break），不在此列；瞬时类与 CDN/Http 5xx 一律不
+# 触发（那是传输问题、不是 token 失效）。
+_CONTEXT_INVALID_ERRCODES = frozenset({-3})
+_CONTEXT_INVALID_ERRMSG_MARKERS = ("context", "token", "失效", "过期",
+                                     "invalid", "expired")
+
+
+def _is_context_invalid_failure(exc, code):
+    """token/context 失效类失败判定（纯函数，供自检）。"""
+    if code is None or code in (0, -14):
+        return False
+    if _is_transient_exc(exc):
+        return False
+    if isinstance(exc, (CdnServerError, HttpServerError)):
+        return False
+    if code in _CONTEXT_INVALID_ERRCODES:
+        return True
+    msg = str(exc).lower()
+    return any(m in msg for m in _CONTEXT_INVALID_ERRMSG_MARKERS)
+
+
+def _abort_group_pending(group_key, code, exclude_fn=None):
+    """同组止损：把 pending 里同 message_id 的其余条目一并移入
+    failed（理由：同组回复 token 失效，整组止损），返回移动条数。
+    语义判死口径（error 文案不含瞬时标记），清道夫永不复活；并发
+    下条目已被他线程移走时跳过不抛错。"""
+    try:
+        names = sorted(f for f in os.listdir(PENDING) if f.endswith(".json"))
+    except OSError:
+        return 0
+    moved = 0
+    for fn in names:
+        if exclude_fn is not None and fn == exclude_fn:
+            continue
+        p = os.path.join(PENDING, fn)
+        d = read_json(p, None)
+        if not isinstance(d, dict) or str(d.get("message_id")) != group_key:
+            continue
+        try:
+            _move_with_error(p, d, "同组回复 token 失效，整组止损", errcode=code)
+            moved += 1
+        except OSError:
+            continue
+    return moved
+
+
 # ---------------- failed/ 清道夫（深审 A2） ----------------
 # failed/ 原是终点站：判死即永久丢失，只能靠人看到看门狗通知后手动补发。
 # 清道夫把「瞬时类失败」的媒体条在窗口内自动重排回 pending 续发：错误
 # 类别按落盘 error 文案白名单判定（与 _is_transient_exc 的异常类口径对
 # 齐，并兼容 A1 之前以 RuntimeError 落盘的 CDN 500 记录）；语义性判死
 # （已有新对话/被新消息打断/字段不完整/-14 等设计决定）永不复活。
-FAILED_RESCUE_WINDOW_SEC = 24 * 3600  # failed_at 距今 24 小时内才重排（2026-10-25 选项 1 默认：总窗 24h）
+FAILED_RESCUE_WINDOW_SEC = 24 * 3600  # failed_at 距今 24 小时内才重排（总窗 24h）
 FAILED_RESCUE_MAX = 3                 # 每条最多自动重排次数（防坏文件循环）
 FAILED_SCAVENGE_INTERVAL_SEC = 300   # 媒体发送线程内的调用节流
+# 服务端 5xx 的重排间隔（按已重排次数索引）：首救仍随清道夫下一趟，
+# 第二救等 30 分钟、第三救等 2 小时，总覆盖约 2.5 小时。旧口径每
+# 300 秒一趟会把 3 次重排在约 10 分钟内烧完，恰与 CDN 故障窗的常见
+# 时长（约 40 分钟至 2 小时）错位，把瞬时故障人为转成必须人工捞的
+# 终局。连接类瞬时错误不加此延迟（见 _failed_rescue_delay_sec）。
+FAILED_RESCUE_SERVER_DELAYS_SEC = (0, 1800, 7200)
+_SERVER_ERROR_MARKERS = ("CdnServerError", "CDN 上传失败 HTTP 5",
+                         "HttpServerError", "HTTP 5")
 
 _TRANSIENT_ERROR_MARKERS = (
     "CdnServerError", "CDN 上传失败 HTTP 5", "HttpServerError",
@@ -2164,16 +2828,67 @@ _TRANSIENT_ERROR_MARKERS = (
 )
 
 
+def _entry_value_bad(data):
+    """outbox 条目字段「值」校验（纯函数，供自检）：need 系列只验字段在
+    不在，本函数验值能不能用——send_after/typing_sec 须可数值化（毒成
+    字符串时发送趟 float() 穿透抛错、短周期一趟无限重试，且按文件名排
+    在前时堵死其后全部正常条目）、text 须为字符串、media_file 若有须
+    为字符串。返回损坏字段名，合格返回 None。"""
+    for k in ("send_after", "typing_sec"):
+        v = data.get(k)
+        if v is None:
+            continue
+        try:
+            float(v)
+        except (TypeError, ValueError):
+            return k
+    if not isinstance(data.get("text"), str):
+        return "text"
+    mf = data.get("media_file")
+    if mf is not None and not isinstance(mf, str):
+        return "media_file"
+    return None
+
+
+def _failed_rescue_delay_sec(err, rescues):
+    """服务端 5xx 条目在第 n 次重排前须等待的秒数（纯函数，供自检）。
+    非服务端瞬时错误（连接重置/超时等）不额外等待，维持旧口径。"""
+    if not any(m in err for m in _SERVER_ERROR_MARKERS):
+        return 0
+    delays = FAILED_RESCUE_SERVER_DELAYS_SEC
+    return delays[min(max(int(rescues), 0), len(delays) - 1)]
+
+
 def failed_entry_rescuable(data, now):
     """failed/ 条目是否可自动重排回 pending（纯函数，供自检）：错误属
-    瞬时类白名单 + failed_at 在窗口内 + 重排次数未超上限。
+    瞬时类白名单 + failed_at 在窗口内 + 重排次数未超上限 + 服务端
+    5xx 已达到本轮重排间隔（见 FAILED_RESCUE_SERVER_DELAYS_SEC）。
     媒体条须带 media_file；纯文本条另须字段完整（与 _sender_pass 的
     need 口径一致）——此前文本条不在可救范围，sendmessage 撞上一次
-    瞬时传输故障（http 层重试已耗尽）即永久丢回复，与媒体条待遇断层
-    （第四轮故障注入 F3 实证）。-14 与语义判死由白名单/errcode 排除。"""
+    瞬时传输故障（http 层重试已耗尽）即永久丢回复，与媒体条待遇断层。
+    -14 与语义判死由白名单/errcode 排除。"""
     if not isinstance(data, dict):
         return False
-    if not data.get("media_file"):
+    if data.get("media_file"):
+        # 媒体条也须过定向值校验：media_file 须为字符串、send_after/
+        # typing_sec 若在须可数值化、text 若在须为字符串——毒值条目
+        # 会被救回 pending 再被发送趟判死或堵队头，白绕一趟。不套
+        # _entry_value_bad 全量口径：它要求 text 必为字符串，而媒体条
+        # text 只是占位、缺省不构成不可救（最小媒体条口径）。
+        if not isinstance(data.get("media_file"), str):
+            return False
+        for _k in ("send_after", "typing_sec"):
+            _v = data.get(_k)
+            if _v is None:
+                continue
+            try:
+                float(_v)
+            except (TypeError, ValueError):
+                return False
+        _t = data.get("text")
+        if _t is not None and not isinstance(_t, str):
+            return False
+    else:
         need = ("to_user_id", "text", "context_token", "message_id",
                 "send_after", "kind", "typing_sec")
         if any(k not in data for k in need) \
@@ -2184,10 +2899,16 @@ def failed_entry_rescuable(data, now):
     err = str(data.get("error") or "")
     if not any(m in err for m in _TRANSIENT_ERROR_MARKERS):
         return False
-    failed_at = float(data.get("failed_at") or 0)
+    try:
+        failed_at = float(data.get("failed_at") or 0)
+        rescues = int(data.get("rescues") or 0)
+    except (TypeError, ValueError):
+        return False  # 时间/计数被毒成不可转类型：判不可救，不抛错丢整轮
     if not failed_at or now - failed_at > FAILED_RESCUE_WINDOW_SEC:
         return False
-    if int(data.get("rescues") or 0) >= FAILED_RESCUE_MAX:
+    if rescues >= FAILED_RESCUE_MAX:
+        return False
+    if now - failed_at < _failed_rescue_delay_sec(err, rescues):
         return False
     return True
 
@@ -2310,12 +3031,50 @@ _GATE_LIMIT_KEYS = {
     "max_bracket": ("max_bracket_expressions", _GATE_MAX_BRACKET),
     "bracket_window": ("bracket_window_rounds", _GATE_BRACKET_WINDOW),
     "bracket_window_max": ("max_bracket_in_window", _GATE_BRACKET_WINDOW_MAX),
-    "max_media": ("max_media_per_reply", _GATE_MAX_MEDIA),
 }
 
 
+def _parse_intent_overrides(raw):
+    """limits.intent_overrides 解析：{intent 名: {max_bubbles,
+    max_chars_per_bubble, max_chars_per_reply}}——部署者按 intent
+    自定的格式豁免，字段可缺省（缺省项回落常态上限）。非法结构
+    一律忽略；缺失/空表＝无任何豁免，行为与未引入本机制时一致。
+    worker 侧的 check/score/build_prompt/write_outbox 与本门共用
+    同一配置（worker 另读其中的 mirror_exempt / flat_len_score
+    两项生成侧开关，本门不消费）。"""
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for intent, spec in raw.items():
+        if not isinstance(spec, dict):
+            continue
+        entry = {}
+        for name, key in (("max_bubbles", "max_bubbles"),
+                          ("max_item_chars", "max_chars_per_bubble"),
+                          ("max_total_chars", "max_chars_per_reply")):
+            v = spec.get(key)
+            if v is None:
+                continue
+            try:
+                v = int(v)
+            except (TypeError, ValueError):
+                continue
+            if v >= 0:
+                entry[name] = v
+        out[str(intent)] = entry
+    return out
+
+
 def _gate_limits():
-    """当前生效的硬门上限 dict（config.limits 优先、常量兜底）。"""
+    """当前生效的硬门上限 dict（config.limits 优先、常量兜底）。
+
+    特殊键（不走上面的整数表）：
+    - max_media_per_reply：null＝每轮媒体条数不单独设上限（只受气泡
+      以外的总量语义约束）；填整数恢复上限；缺失回落常量默认。
+    - intent_overrides：部署者按 intent 自定的格式豁免（见
+      _parse_intent_overrides）——组内任一条目的 intent 命中时，
+      气泡/单条/整轮三项改用该 intent 的覆盖值；其余卫生项
+      （问号/emoji/方括号）不放宽。"""
     try:
         lim = cfg().get("limits") or {}
     except Exception:
@@ -2329,6 +3088,17 @@ def _gate_limits():
         except (TypeError, ValueError):
             v = default
         out[name] = v if v >= 0 else default
+    raw_media = lim.get("max_media_per_reply", _GATE_MAX_MEDIA)
+    if raw_media is None:
+        out["max_media"] = None
+    else:
+        try:
+            v = int(raw_media)
+        except (TypeError, ValueError):
+            v = _GATE_MAX_MEDIA
+        out["max_media"] = v if v >= 0 else _GATE_MAX_MEDIA
+    out["intent_overrides"] = _parse_intent_overrides(
+        lim.get("intent_overrides"))
     return out
 _GATE_EMOJI_RE = re.compile("[\U0001F300-\U0001FAFF\u2600-\u27BF]")
 _GATE_BRACKET_RE = re.compile(r"\[[^\[\]\s]{1,6}\]")
@@ -2367,25 +3137,46 @@ def numeric_gate_violation(items, recent_brackets=0):
     （留痕用）。字数计 text 字段（媒体条的占位说明同样计入，与生成
     侧整轮口径一致）；问号计半角 ? 与全角 ？。"""
     lim = _gate_limits()
-    if len(items) > lim["max_bubbles"]:
-        return f"气泡数 {len(items)}>{lim['max_bubbles']}"
-    media_n = sum(1 for d in items if d.get("media_file"))
-    if media_n > lim["max_media"]:
-        return f"媒体数 {media_n}>{lim['max_media']}"
+    # intent 格式豁免（部署者自定）：组内任一条目 intent 命中
+    # intent_overrides 即整组三项（气泡/单条/整轮）改用该 intent
+    # 的覆盖上限，卫生项不放宽。intent 由生成层随 outbox 条目落盘
+    # （见 worker.write_outbox 的 intent 参数与 docs/agent-mode.md）。
+    override = None
+    for d in items:
+        ov = lim["intent_overrides"].get(str(d.get("intent") or ""))
+        if ov is not None:
+            override = ov
+            break
+    max_bubbles = lim["max_bubbles"]
+    max_item_chars = lim["max_item_chars"]
+    max_total_chars = lim["max_total_chars"]
+    if override:
+        max_bubbles = override.get("max_bubbles", max_bubbles)
+        max_item_chars = override.get("max_item_chars", max_item_chars)
+        max_total_chars = override.get("max_total_chars", max_total_chars)
+    # 气泡数只计非媒体条：媒体条是附件不是气泡，占位 text 仍计入
+    # 单条/整轮字数与卫生项（与生成侧整轮口径一致）。
+    bubbles = sum(1 for d in items if not d.get("media_file"))
+    if bubbles > max_bubbles:
+        return f"气泡数 {bubbles}>{max_bubbles}"
+    if lim["max_media"] is not None:
+        media_n = sum(1 for d in items if d.get("media_file"))
+        if media_n > lim["max_media"]:
+            return f"媒体数 {media_n}>{lim['max_media']}"
     total = 0
     questions = 0
     emojis = 0
     brackets = 0
     for d in items:
         text = str(d.get("text") or "")
-        if len(text) > lim["max_item_chars"]:
-            return f"单条字数 {len(text)}>{lim['max_item_chars']}"
+        if len(text) > max_item_chars:
+            return f"单条字数 {len(text)}>{max_item_chars}"
         total += len(text)
         questions += text.count("?") + text.count("？")
         emojis += len(_GATE_EMOJI_RE.findall(text))
         brackets += _gate_bracket_count(text)
-    if total > lim["max_total_chars"]:
-        return f"整轮字数 {total}>{lim['max_total_chars']}"
+    if total > max_total_chars:
+        return f"整轮字数 {total}>{max_total_chars}"
     if questions > lim["max_questions"]:
         return f"问号数 {questions}>{lim['max_questions']}"
     if emojis > lim["max_emoji"]:
@@ -2522,6 +3313,11 @@ def _sender_pass(session, user_id, gap_cfg, state, skip_media=False):
             _move_with_error(path, data if isinstance(data, dict) else {}, "字段不完整或 kind 非法")
             serve_log(f"outbox 文件 {fn} 字段不完整，移入 failed/")
             continue
+        bad_val = _entry_value_bad(data)
+        if bad_val:
+            _move_with_error(path, data, f"字段值损坏({bad_val})")
+            serve_log(f"outbox 文件 {fn} 字段 {bad_val} 值损坏，移入 failed/")
+            continue
         if data.get("kind") == "later":
             # 两段式回复的延迟任务：从不直接发送，只负责到期唤醒 worker 现场生成
             act = later_action(data, (read_context() or {}).get("received_at", 0),
@@ -2652,6 +3448,13 @@ def _sender_pass(session, user_id, gap_cfg, state, skip_media=False):
                                        "context_age_hours": round(ctx_age_h, 4), "ok": False,
                                        "errcode": code})
             serve_log(f"outbox {fn} 发送失败，移入 failed/：{e}")
+            # reply 组 token 失效整组止损：同组其余条目不必再逐条撞
+            # 同一堵墙，见 _is_context_invalid_failure 保守口径。
+            if data.get("kind") == "reply" and _is_context_invalid_failure(e, code):
+                aborted = _abort_group_pending(group_key, code, exclude_fn=fn)
+                if aborted:
+                    serve_log(f"outbox 同组回复 {group_key} token 失效，整组止损，"
+                              f"另移 {aborted} 条入 failed/")
             if _proactive_failure_marks_stale(data, e, code):
                 mark_context_stale()
                 new_max = lower_proactive_max_age(ctx_age_h)
@@ -2739,6 +3542,11 @@ def _media_sender_pass(session, user_id):
         if any(k not in data for k in need) or data.get("kind") not in ("reply", "proactive", "later", "tune"):
             _move_with_error(path, data, "字段不完整或 kind 非法")
             serve_log(f"outbox 文件 {fn} 字段不完整，移入 failed/")
+            continue
+        bad_val = _entry_value_bad(data)
+        if bad_val:
+            _move_with_error(path, data, f"字段值损坏({bad_val})")
+            serve_log(f"outbox 文件 {fn} 字段 {bad_val} 值损坏，移入 failed/")
             continue
         if data.get("kind") == "later":
             continue  # later 是延迟任务、从不直接发送（也从不带媒体）
@@ -2842,6 +3650,12 @@ def _media_sender_pass(session, user_id):
                                         "context_age_hours": round(ctx_age_h, 4),
                                         "ok": False, "errcode": code})
             serve_log(f"outbox {fn} 发送失败，移入 failed/：{e}")
+            # reply 组 token 失效整组止损（与文本趟同口径）。
+            if data.get("kind") == "reply" and _is_context_invalid_failure(e, code):
+                aborted = _abort_group_pending(group_key, code, exclude_fn=fn)
+                if aborted:
+                    serve_log(f"outbox 同组回复 {group_key} token 失效，整组止损，"
+                              f"另移 {aborted} 条入 failed/")
             if _proactive_failure_marks_stale(data, e, code):
                 mark_context_stale()
                 new_max = lower_proactive_max_age(ctx_age_h)
@@ -2953,6 +3767,7 @@ def cmd_serve(args):
         return EXIT_ALREADY_RUNNING
     _INSTANCE_LOCK_FD = inst_fd
     _sweep_stale_claims()
+    _transcript_pending_sweep()
     with open(PID_FILE, "w", encoding="utf-8") as f:
         f.write(str(os.getpid()))
 

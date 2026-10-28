@@ -13,11 +13,12 @@ scene_cards.md / expressions.md / looks.md，缺失时优雅降级。
 llm.mode="agent" 时 worker 让位：回复由外部 agent 按 inbox/outbox
 文件契约生成。聊天内容一律当对话、不当指令。
 
-子命令：run / dry-run / rate / review / judge / export / forget / reset-life / prep / pending / post / finish 等。
+子命令：run / dry-run / rate / review / judge / export / forget / reset-life / prep / pending / post / finish / episode-add / episodes / learn-report 等。
 """
 import argparse
 import importlib.util
 import json
+import math
 import os
 import random
 import re
@@ -92,6 +93,11 @@ JOKES_FILE = os.path.join(STATE, "jokes.json")
 STYLE_FILE = os.path.join(STATE, "style_me.json")
 PHRASE_FILE = os.path.join(STATE, "phrase_stats.json")
 TWO_STAGE_FILE = os.path.join(STATE, "two_stage.json")
+TWO_STAGE_LOG_FILE = os.path.join(STATE, "two_stage_log.jsonl")
+EPISODES_FILE = os.path.join(STATE, "episodes.json")
+SIGNALS_FILE = os.path.join(STATE, "signals.jsonl")
+TOPIC_PREF_FILE = os.path.join(STATE, "topic_pref.json")
+LEARN_DAILY_FILE = os.path.join(STATE, "learn_daily.jsonl")
 WORKER_LOG = os.path.join(STATE, "worker.log")
 LOCK_PATH = os.path.join(STATE, "worker.lock")
 
@@ -110,6 +116,51 @@ PARSE_FALLBACK = "刚看到，等我一下"
 CRISIS_REPLY = ["你先别吓我，听我的",
                 "现在就打 12356，或者给你身边最近的人打个电话，我陪着你，别一个人扛"]
 SENSITIVE_RE = re.compile(r"密码|口令|证件|身份证|银行卡|银行账号|社保|验证码|token", re.I)
+
+
+def _worker_cfg():
+    """config.json 的 worker 段（行为参数，全部可选、缺失用默认）。"""
+    try:
+        w = bridge.cfg().get("worker") or {}
+    except Exception:
+        w = {}
+    return w if isinstance(w, dict) else {}
+
+
+def _wcfg_num(key, default):
+    try:
+        v = float(_worker_cfg().get(key, default))
+    except (TypeError, ValueError):
+        return default
+    return v
+
+
+def _intent_override(intent):
+    """config.limits.intent_overrides 中某 intent 的覆盖条目（原始
+    dict，含数值三项与 mirror_exempt / flat_len_score 两开关）；
+    未配置返回 None。与 bridge._gate_limits 共用同一配置：bridge
+    侧只消费数值三项，本函数供 worker 的校验/打分/组装共用。"""
+    try:
+        ov = (bridge.cfg().get("limits") or {}).get("intent_overrides") or {}
+    except Exception:
+        ov = {}
+    if not isinstance(ov, dict):
+        return None
+    spec = ov.get(str(intent or ""))
+    return spec if isinstance(spec, dict) else None
+
+
+def _override_num(spec, key):
+    if not spec:
+        return None
+    v = spec.get(key)
+    if v is None:
+        return None
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return None
+    return v if v >= 0 else None
 
 
 def load_persona_text():
@@ -433,8 +484,29 @@ def praise_count_recent(records, n=10):
     return sum(1 for r in recent if any(m in str(r.get("reply", "")) for m in PRAISE_MARKERS))
 
 
+def _two_stage_log(intent, result):
+    """两段式判定审计：每次判定（含未触发）落一行 state/
+    two_stage_log.jsonl，让「为什么没触发」事后可查。写失败吞掉，
+    绝不影响判定本身。"""
+    try:
+        bridge.append_jsonl(TWO_STAGE_LOG_FILE,
+                            {"ts": time.time(), "intent": str(intent),
+                             "trigger": bool(result.get("trigger")),
+                             "reason": str(result.get("reason", ""))})
+    except Exception:
+        pass
+
+
 def two_stage_decision(intent, now=None, roll=None):
-    """两段式回复判定（5.3）：全部条件满足且概率命中才触发。返回 dict。"""
+    """两段式回复判定（5.3）：全部条件满足且概率命中才触发。返回 dict。
+
+    本包装负责判定审计落盘；实际判定在 _two_stage_decide_inner。"""
+    result = _two_stage_decide_inner(intent, now=now, roll=roll)
+    _two_stage_log(intent, result)
+    return result
+
+
+def _two_stage_decide_inner(intent, now=None, roll=None):
     now = now or time.time()
     if intent not in ("chat", "share", "playful"):
         return {"trigger": False, "reason": f"intent={intent} 不触发"}
@@ -443,7 +515,7 @@ def two_stage_decision(intent, now=None, roll=None):
     placeholder = next((p for k, p in BUSY_PLACEHOLDERS if k in sched), None)
     if not placeholder and life.get("busy_level") in ("mid", "high"):
         # mid/high 本义就是在忙：日程串没命中关键词时给通用占位语；
-        # low 是真闲着，仍不触发（不装忙）。概率 0.15/每天 ≤2 不动。
+        # low 是真闲着，仍不触发（不装忙）。每天 ≤2 不动。
         placeholder = "在忙，等下"
     if not placeholder:
         return {"trigger": False, "reason": "当下不忙"}
@@ -454,8 +526,9 @@ def two_stage_decision(intent, now=None, roll=None):
     count = int(st.get("count", 0)) if st.get("date") == today else 0
     if count >= 2:
         return {"trigger": False, "reason": "今日已触发 2 次"}
-    if (roll if roll is not None else random.random()) >= 0.15:
-        return {"trigger": False, "reason": "概率未命中（0.15）"}
+    prob = _wcfg_num("two_stage_probability", 0.25)
+    if (roll if roll is not None else random.random()) >= prob:
+        return {"trigger": False, "reason": f"概率未命中（{prob}）"}
     # 计数落盘进 state_lock 并锁内复核上限：并发判定同读旧 count 时会
     # 双双通过、增量互相覆盖（每日 ≤2 次被击穿），与 finish 计数同族
     with bridge.state_lock():
@@ -615,6 +688,207 @@ def mark_joke_used(text):
     return False
 
 
+# ---------------- 情景记忆 episodes ----------------
+# 与 facts 分工：facts 存稳定事实（对方是谁、喜好作息），episodes
+# 存共同经历事件（一起经历过的事、对方提过的生活细节、情绪事件、
+# 两人之间的梗、约定与纪念日），条目带事件日期与出处，只许来自
+# 真实聊天、不许编造；与 facts 判重，同一件事只在一处存。
+EPISODE_KINDS = ("shared_experience", "his_detail", "emotion_event",
+                 "inside_joke", "promise", "anniversary")
+
+
+def _episodes_cap():
+    return int(_wcfg_num("episodes_cap", 150))
+
+
+def load_episodes():
+    data = bridge.read_json(EPISODES_FILE, {}) or {}
+    items = data.get("episodes", []) if isinstance(data, dict) else []
+    return [e for e in items if isinstance(e, dict)]
+
+
+def save_episodes(items):
+    bridge.write_json_locked(
+        EPISODES_FILE, {"episodes": items,
+                        "updated": today_local().date().isoformat()})
+
+
+def _episode_norm(s):
+    return re.sub(r"[\s，。！？、；：·…—「」『』“”‘’（）()]",
+                  "", str(s or "")).lower()
+
+
+def episode_dedupe_hit(text):
+    """判重（三层）：① 与 active episode 规范化互含；② 与 active
+    episode 的规范化 bigram 相似度 >0.78（同义近似条目实测约
+    0.79，前缀相同但话题不同的约 0.43，不会误杀）；③ 与 facts
+    档案（facts 与 user_facts 两段）条目规范化互含（事实侧长度
+    ≥6）。命中返回说明，未命中返回 None。"""
+    norm = _episode_norm(text)
+    if not norm:
+        return "空文本"
+    for e in load_episodes():
+        if e.get("status", "active") != "active":
+            continue
+        en = _episode_norm(e.get("text", ""))
+        if en and (en in norm or norm in en
+                   or similarity(en, norm) > 0.78):
+            return "与既有 episode 重复"
+    data = bridge.read_json(FACTS_FILE, {}) or {}
+    entries = []
+    if isinstance(data, dict):
+        entries = list(data.get("facts", []) or []) \
+            + list(data.get("user_facts", []) or [])
+    for e in entries:
+        t, _d = _fact_text(e)
+        fn = _episode_norm(t)
+        if fn and len(fn) >= 6 and (fn in norm or norm in fn):
+            return "已在 facts 类档案中"
+    return None
+
+
+def add_episode(kind, text, date=None, source="chat"):
+    """落账一条情景记忆；判重命中或含敏感信息不落账。date 是事件
+    指向的日期（约定/纪念日），缺省取今天。返回 {added, reason}。"""
+    text = str(text or "").strip()[:200]
+    if not text:
+        return {"added": False, "reason": "空文本"}
+    if SENSITIVE_RE.search(text):
+        return {"added": False, "reason": "含敏感信息，不落账"}
+    if kind not in EPISODE_KINDS:
+        kind = "his_detail"
+    hit = episode_dedupe_hit(text)
+    if hit:
+        return {"added": False, "reason": hit}
+    today = today_local().date().isoformat()
+    ev_date = str(date)[:10] if date else today
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", ev_date):
+        ev_date = today
+    items = load_episodes()
+    items.append({"id": f"ep-{int(time.time())}-{random.randint(0, 0xFFFF):04x}",
+                  "kind": kind, "text": text, "date": ev_date,
+                  "added": today, "source": str(source)[:60],
+                  "status": "active", "last_surfaced": None})
+    act = [e for e in items if e.get("status", "active") == "active"]
+    overflow = len(act) - _episodes_cap()
+    for e in act:
+        if overflow <= 0:
+            break
+        if e.get("kind") in ("promise", "anniversary"):
+            continue  # 约定/纪念日不自动归档（全为这两类时可超上限）
+        e["status"] = "archived"
+        overflow -= 1
+    save_episodes(items)
+    return {"added": True, "reason": "ok"}
+
+
+def episodes_brief():
+    """简报回提：近期共同经历（按日轮换，避免天天同几条）＋ 窗口
+    内临近的约定/纪念日，条目带日期供核对。条数与窗口天数走
+    config.worker（episodes_brief_recent / episodes_brief_upcoming /
+    episodes_upcoming_window_days）。"""
+    today = today_local().date()
+    window = int(_wcfg_num("episodes_upcoming_window_days", 7))
+    n_up = int(_wcfg_num("episodes_brief_upcoming", 2))
+    n_recent = int(_wcfg_num("episodes_brief_recent", 3))
+    items = [e for e in load_episodes()
+             if e.get("status", "active") == "active"]
+    upcoming = []
+    for e in items:
+        if e.get("kind") not in ("promise", "anniversary"):
+            continue
+        try:
+            d = datetime.strptime(str(e.get("date", "")), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if 0 <= (d - today).days <= window:
+            upcoming.append({"kind": e["kind"], "text": e["text"],
+                             "date": e["date"]})
+    pool = [e for e in items
+            if e.get("kind") not in ("promise", "anniversary")]
+    pool.sort(key=lambda e: str(e.get("added", "")), reverse=True)
+    if pool:
+        off = today.toordinal() % len(pool)
+        pool = pool[off:] + pool[:off]
+    recent = [{"kind": e["kind"], "text": e["text"],
+               "date": e.get("date", ""), "added": e.get("added", "")}
+              for e in pool[:n_recent]]
+    return {"recent": recent, "upcoming": upcoming[:n_up],
+            "note": "与本轮话题自然衔接时可轻轻带出一句认领记忆，"
+                    "不背诵、不逐条播报；细节拿不准就不提"}
+
+
+# ---------------- 真人感简报供给 ----------------
+
+def _opener_of(text):
+    t = str(text or "").strip()
+    head = re.split(r"[，。！？、…\n]", t, maxsplit=1)[0] if t else ""
+    return (head or t)[:4]
+
+
+def opener_recent(n=10):
+    """近 n 轮回复的句首 opener 计数 + 冷却标记：只给计数，用过
+    >2 次标冷却，生成端自行避开（与 emoji_recent 同机制，防句首
+    单点塌陷）。"""
+    recs = [r for r in bridge.read_jsonl(RECORDS_FILE)
+            if not r.get("skipped") and not r.get("proactive")][-n:]
+    counts = {}
+    for r in recs:
+        op = _opener_of(r.get("reply", ""))
+        if op:
+            counts[op] = counts.get(op, 0) + 1
+    return [{"opener": k, "count": v, "cooling": v > 2}
+            for k, v in sorted(counts.items(), key=lambda kv: -kv[1])[:6]]
+
+
+def rhythm_recent(n=12):
+    """句长节奏供给：近 n 轮气泡长度的变异系数（CV）与中位长。
+    只供给、给提示，不设硬配额；CV 偏低（阈值 config.worker
+    .rhythm_cv_hint_below）时 hint 给一句长短交错的提醒。口径与
+    scripts/realism_audit.py 的句长 CV 指标一致（气泡按空格切分、
+    CV＝标准差/均值）。"""
+    recs = [r for r in bridge.read_jsonl(RECORDS_FILE)
+            if not r.get("skipped") and not r.get("proactive")][-n:]
+    lens = []
+    for r in recs:
+        for b in str(r.get("reply", "")).split(" "):
+            if b.strip():
+                lens.append(len(b))
+    if len(lens) < 4:
+        return {"cv": None, "median": None, "bubbles": len(lens), "hint": ""}
+    mean = sum(lens) / len(lens)
+    var = sum((x - mean) ** 2 for x in lens) / len(lens)
+    cv = round(math.sqrt(var) / mean, 3) if mean else None
+    med = sorted(lens)[len(lens) // 2]
+    hint = ""
+    below = _wcfg_num("rhythm_cv_hint_below", 0.40)
+    if cv is not None and cv < below:
+        hint = (f"最近气泡句长偏整齐（CV {cv}、中位 {med} 字）：这轮"
+                "注意长短交错——短句打头或收尾、展开的句子放中间，"
+                "别每条都差不多长")
+    return {"cv": cv, "median": med, "bubbles": len(lens), "hint": hint}
+
+
+_STANCE_MARKERS = ("想吃", "爱吃", "喜欢吃", "不吃", "我喜欢", "我不喜欢",
+                   "我讨厌", "我想去", "我想看", "我觉得", "受不了",
+                   "最烦", "超爱", "偏爱", "就爱", "不想吃", "不想去")
+
+
+def stance_today():
+    """今日表态可见性：今日回复轮数、其中亮明好恶/立场的轮数、今日
+    表态种子。只显性化缺口计数与种子，不算目标达成率——种子一直在
+    pack 里但行为可能没跟上，把缺口放进简报让生成端看得见。"""
+    today = today_local().date()
+    recs = [r for r in bridge.read_jsonl(RECORDS_FILE)
+            if not r.get("skipped") and not r.get("proactive")
+            and datetime.fromtimestamp(float(r.get("ts", 0) or 0),
+                                       bridge.tz()).date() == today]
+    stance = sum(1 for r in recs
+                 if any(m in str(r.get("reply", "")) for m in _STANCE_MARKERS))
+    return {"rounds_today": len(recs), "stance_rounds_today": stance,
+            "seed": today_preference()}
+
+
 def quiet_today():
     """察觉变化（5.8）：他最近 3 条比过去 7 天平均短一半，或连续 3 条极短回复。"""
     hist = [h for h in bridge.read_jsonl(bridge.HISTORY_FILE)
@@ -670,16 +944,171 @@ def _refresh_prefix_cache(persona, facts):
         f.write(digest)
 
 
+# ---------------- 学习信号与可见性 ----------------
+_LAUGH_KEYS = ("哈哈", "笑死", "笑喷", "乐死", "😂", "🤣", "笑哭")
+_MEDIA_PHOTO_KEYS = ("照片", "自拍", "发张图", "拍一张", "图片")
+_MEDIA_VIDEO_KEYS = ("视频", "录一段", "录个视频", "跳舞", "唱首歌")
+
+
+def his_avg_len(n=50):
+    """他近 n 条消息的平均字数（auto_feedback 的 len_rel 基准）。"""
+    lens = [len(str(h.get("text", "")).strip())
+            for h in bridge.read_jsonl_tail(bridge.HISTORY_FILE, 400)
+            if h.get("role") == "user" and str(h.get("text", "")).strip()]
+    lens = [x for x in lens if x][-n:]
+    return round(sum(lens) / len(lens), 1) if lens else None
+
+
+def record_round_signals(batch, prev):
+    """把他对上一轮回复的行为信号落进 signals.jsonl：回复时延、他
+    的字数与气泡数、是否被逗笑、是否索要照片/视频、是否提问。
+    按上一轮 ts 判重（同轮多次进入不重复落账）。这些信号是原始
+    行为数据，不直接改旋钮；由 topic_pref 聚合与 learn-report
+    可见性消费。"""
+    if not prev or not batch:
+        return None
+    pts = float(prev.get("ts", 0) or 0)
+    if not pts:
+        return None
+    tail = bridge.read_jsonl_tail(SIGNALS_FILE, 40)
+    if any(abs(float(s.get("about_ts", 0) or 0) - pts) < 1 for s in tail):
+        return None
+    stamps = []
+    for m in batch:
+        ms = m.get("create_time_ms")
+        if ms:
+            stamps.append(float(ms) / 1000.0)
+    texts = [str(m.get("text", "") or "") for m in batch]
+    joined = "\n".join(texts)
+    sig = {"ts": time.time(), "about_ts": pts,
+           "intent": str(prev.get("intent", "")),
+           "his_latency_sec": (round(min(stamps) - pts, 1)
+                               if stamps else None),
+           "his_len": sum(len(t) for t in texts),
+           "his_bubbles": len([t for t in texts if t.strip()]),
+           "laughed": any(k in joined for k in _LAUGH_KEYS),
+           "media_photo": any(k in joined for k in _MEDIA_PHOTO_KEYS),
+           "media_video": any(k in joined for k in _MEDIA_VIDEO_KEYS),
+           "his_question": ("？" in joined or "?" in joined)}
+    bridge.append_jsonl(SIGNALS_FILE, sig)
+    return sig
+
+
+def topic_pref_summary():
+    """话题偏好聚合（signals 派生）：按上一轮 intent 分组统计他的
+    投入度（平均字数、笑声率、时延中位），外加索要图/视频计数。
+    供简报提示往他投入的话题上靠、媒体形态跟他的实际索要走。"""
+    sigs = bridge.read_jsonl(SIGNALS_FILE)
+    by = {}
+    media = {"photo": 0, "video": 0}
+    for s in sigs:
+        if s.get("media_photo"):
+            media["photo"] += 1
+        if s.get("media_video"):
+            media["video"] += 1
+        g = by.setdefault(str(s.get("intent", "") or "chat"),
+                          {"n": 0, "len": 0, "laugh": 0, "lat": []})
+        g["n"] += 1
+        g["len"] += int(s.get("his_len", 0) or 0)
+        g["laugh"] += 1 if s.get("laughed") else 0
+        if s.get("his_latency_sec") is not None:
+            g["lat"].append(float(s["his_latency_sec"]))
+    out_by = {}
+    for k, g in by.items():
+        lat = sorted(g["lat"])
+        out_by[k] = {
+            "n": g["n"],
+            "avg_his_len": round(g["len"] / g["n"], 1) if g["n"] else 0,
+            "laugh_rate": round(g["laugh"] / g["n"], 2) if g["n"] else 0,
+            "median_latency_sec": (lat[len(lat) // 2] if lat else None)}
+    return {"n_signals": len(sigs), "by_intent": out_by,
+            "media_asks": media}
+
+
+def learn_report():
+    """学习可见性报告：反馈覆盖与非零率、信号量、快照天数、promote
+    门槛逐旋钮评估（未锁定旋钮近 3 天快照同向与否、距 ±0.5 门槛
+    还差多少）、pref 权重前五。让学习环「在不在学」随时可查，
+    不再只看 proposals 是否为空。"""
+    fb = bridge.read_jsonl(os.path.join(STATE, "feedback.jsonl"))
+    now = time.time()
+    week = [f for f in fb if float(f.get("ts", 0) or 0) >= now - 7 * 86400]
+    zero = sum(1 for f in week if not f.get("score"))
+    tj = tune.load_tune()
+    snaps = tj.get("snapshots", {}) or {}
+    days = sorted(snaps.keys())
+    last3 = days[-3:]
+    locks = tj.get("locks", {}) or {}
+    deltas = tj.get("deltas", {}) or {}
+    watch = []
+    for knob in tune.DEFAULT_KNOBS:
+        vals = [float(snaps[d].get(knob, 0.0)) for d in last3]
+        entry = {"knob": knob, "locked": knob in locks,
+                 "delta_now": float(deltas.get(knob, 0.0)), "last3": vals}
+        if knob in locks:
+            entry["promote"] = "已锁定，跳过评估（纪律保留）"
+        elif len(last3) < 3:
+            entry["promote"] = f"快照 {len(days)} 天，3 天窗口未满"
+        elif all(v >= 0.5 for v in vals) or all(v <= -0.5 for v in vals):
+            entry["promote"] = "已达门槛，应已生成长期建议"
+        elif all(v > 0 for v in vals) or all(v < 0 for v in vals):
+            entry["promote"] = ("同向累积中，距门槛 "
+                                f"{round(0.5 - min(abs(v) for v in vals), 3)}")
+        else:
+            entry["promote"] = "方向未一致"
+        watch.append(entry)
+    pref = bridge.read_json(os.path.join(STATE, "pref.json"), {}) or {}
+    weights = pref.get("w", {}) if isinstance(pref, dict) else {}
+    pref_top = []
+    if isinstance(weights, dict):
+        pref_top = [{"feature": k, "weight": round(float(v), 3)}
+                    for k, v in sorted(
+                        weights.items(),
+                        key=lambda kv: -abs(float(kv[1])))[:5]]
+    return {"feedback_total": len(fb), "feedback_7d": len(week),
+            "feedback_zero_share_7d": (round(zero / len(week), 3)
+                                       if week else None),
+            "feedback_last_date": (
+                datetime.fromtimestamp(
+                    max((float(f.get("ts", 0) or 0) for f in fb),
+                        default=0), bridge.tz()).date().isoformat()
+                if fb else None),
+            "signals_total": len(bridge.read_jsonl(SIGNALS_FILE)),
+            "snapshot_days": days, "promote_watch": watch,
+            "pref_top": pref_top, "topic_pref": topic_pref_summary()}
+
+
+def score_batch_feedback(batch):
+    """给上一条回复打分＋落行为信号（学习环统一入口）。
+
+    cmd_pending（领取）、cmd_prep、run() 循环三条路径共用。打分
+    锚在每轮必经的领取动作上：批次一经领取即以这批他的消息为
+    反应给上一轮打分——只挂在每日一次的 prep 上会断供（agent
+    模式下 prep 不是每轮必经）。判重由 tune.auto_feedback
+    （batch_key＝批次末条 message_id）与 record_round_signals
+    （about_ts）两侧兜住，多入口、重复领取都不双计。伪消息
+    （补取/转写补达记录）不作反应源。"""
+    real = [m for m in (batch or [])
+            if m.get("type") not in ("media_refetch", "video_transcript")]
+    if not real:
+        return None
+    prev = tune.last_reply_record()
+    if not prev:
+        return None
+    text = "\n".join(str(m.get("text", "")) for m in real if m.get("text"))
+    gap = time.time() - float(prev.get("ts", time.time()))
+    batch_key = str(real[-1].get("message_id") or "") or None
+    fb = tune.auto_feedback(text, gap_sec=gap, last=prev,
+                            user_avg_len=his_avg_len(), batch_key=batch_key)
+    record_round_signals(real, prev)
+    return fb
+
+
 def process_feedback(batch):
     """阶段六 6.3：新消息到达时，先用代码规则给她的上一条回复打分。"""
     global _LAST_CODE_FB
     try:
-        last = tune.last_reply_record()
-        if not last:
-            return
-        gap = time.time() - float(last.get("ts", time.time()))
-        text = "\n".join(str(m.get("text", "")) for m in batch if m.get("text"))
-        _LAST_CODE_FB = tune.auto_feedback(text, gap_sec=gap, last=last)
+        _LAST_CODE_FB = score_batch_feedback(batch) or {}
     except Exception as e:
         wlog(f"隐式反馈处理异常（忽略）：{e}")
 
@@ -799,17 +1228,23 @@ def round_brief():
             "jokes": [j["text"] for j in joke_candidates()],
             "style_summary": style.get("summary", ""), "quiet_today": quiet_today(),
             "probe_alert": probe_scan(), "emoji_recent": bracket_emoji_recent(),
-            "emoji_pool": emoji_pool_counts()}
+            "emoji_pool": emoji_pool_counts(),
+            "opener_recent": opener_recent(), "rhythm_recent": rhythm_recent(),
+            "stance_today": stance_today(), "episodes": episodes_brief(),
+            "topic_pref": topic_pref_summary()}
 
 
 
 def summarize_yesterday(hist):
-    """返回 (摘要文本, 未完事项)；没有昨天的记录则返回空。"""
+    """返回 (摘要文本, 未完事项, episodes 条目列表)；没有昨天的记录
+    则返回空。抽取口径：各类事件（包括关系类事件）同等收录，不因
+    题材淡化、略过或改写失真——落账侧本身无题材过滤（仅敏感词
+    拒落），风险全在抽取提示的收录口径，故在此明文写死。"""
     now = today_local()
     y_start, y_end = day_bounds((now - timedelta(days=1)).date())
     rows = [h for h in hist if y_start.timestamp() <= float(h.get("ts", 0)) < y_end.timestamp()]
     if not rows:
-        return "", ""
+        return "", "", []
     lines = []
     for h in rows[-200:]:
         who = "他" if h.get("role") == "user" else "我"
@@ -817,16 +1252,29 @@ def summarize_yesterday(hist):
         if t:
             lines.append(f"{who}：{t}")
     digest = "\n".join(lines)[:4000]
-    prompt = ("把下面这一天的微信聊天记录总结成 150 字以内的摘要（只写发生的事和情绪，"
-              "不要评价），并单列还没聊完、值得之后接上的事项。只输出 JSON："
-              "{\"summary\": \"摘要\", \"unfinished\": \"未完事项，没有就空字符串\"}\n\n" + digest)
+    prompt = ("把下面这一天的聊天记录总结成 150 字以内的摘要（只写发生的事和情绪，"
+              "不要评价；各类事件同样如实记述，不淡化、不略过），并单列还没聊完、"
+              "值得之后接上的事项；再抽取值得长久记住的共同经历条目（两人一起"
+              "经历的事、对方提过的生活细节、情绪事件、两人之间的梗、约定或"
+              "纪念日），其中关系类共同经历与其它共同经历同等抽取，不因题材"
+              "淡化、略过或改写失真（关系类约定归 promise、关系类纪念归 "
+              "anniversary，其余关系类经历归 shared_experience；对方个人细节归 "
+              "his_detail、情绪事件归 emotion_event、两人之间的梗归 "
+              "inside_joke），每条一句、只写真实发生过的，没有就空数组。"
+              "只输出 JSON："
+              "{\"summary\": \"摘要\", \"unfinished\": \"未完事项，没有就空字符串\", "
+              "\"episodes\": [{\"kind\": \"shared_experience|his_detail|emotion_event|"
+              "inside_joke|promise|anniversary\", \"text\": \"一句话\", "
+              "\"date\": \"事件日期 YYYY-MM-DD\"}]}\n\n" + digest)
     try:
         out = llm.call(prompt, kind="summary")
         data = parse_json_object(out)
-        return str(data.get("summary", ""))[:300], str(data.get("unfinished", ""))[:200]
+        eps = [e for e in (data.get("episodes") or []) if isinstance(e, dict)]
+        return (str(data.get("summary", ""))[:300],
+                str(data.get("unfinished", ""))[:200], eps[:5])
     except Exception as e:
         wlog(f"昨日摘要生成失败：{e}")
-        return "", ""
+        return "", "", []
 
 
 def daily_prep():
@@ -840,10 +1288,16 @@ def daily_prep():
     summaries = bridge.read_jsonl(SUMMARIES_FILE)
     unfinished = ""
     if not any(s.get("date") == yday for s in summaries):
-        text, unfinished = summarize_yesterday(hist)
+        text, unfinished, y_eps = summarize_yesterday(hist)
         if text:
             bridge.append_jsonl(SUMMARIES_FILE, {"date": yday, "text": text,
                                                  "unfinished": unfinished, "ts": time.time()})
+        # 每日轻量捕获：昨日摘要抽出的共同经历直接落 episodes
+        # （add_episode 内判重，与 facts 分工，重复不入）
+        for ep in y_eps:
+            add_episode(str(ep.get("kind", "his_detail")),
+                        str(ep.get("text", "")), ep.get("date"),
+                        source=f"daily-summary {yday}")
     else:
         unfinished = next((s.get("unfinished", "") for s in summaries if s.get("date") == yday), "")
     life = bridge.read_json(LIFE_FILE, {}) or {}
@@ -950,21 +1404,35 @@ def check_candidate(bubbles, ctx):
         if re.search(r"^\s*([-*•·#>]|\d+[.、)）])", b) or "**" in b or "`" in b:
             violations.append("格式像写文档（列表/加粗）")
             break
-    if len(bubbles) > int(cfg["max_bubbles"]):
+    # intent 格式豁免（部署者自定，config.limits.intent_overrides）：
+    # 命中 intent 的条数/单条/整轮上限与镜像豁免改用覆盖值，与发送
+    # 侧硬门（bridge.numeric_gate_violation）同口径；未配置时全部
+    # 回落下面的常态值，行为不变。卫生项（问号/emoji 等）不豁免。
+    ov = _intent_override(intent)
+    max_bubbles = _override_num(ov, "max_bubbles")
+    if max_bubbles is None:
+        max_bubbles = int(cfg["max_bubbles"])
+    if len(bubbles) > max_bubbles:
         violations.append("条数超限")
     # 格式口径与现行放开参数对齐（与发送侧硬门同口径）：单条 ≤90 字、
     # 问号 ≤2、emoji ≤2 且近 5 轮合并 ≤4。此前 worker 还停在放开前的
     # 60 字 / 1 问号 / 1 emoji，cli 备用链路会把 agent 模式下合规的回复
     # 误判违规、反复重写。
-    if any(len(b) > 90 for b in bubbles):
-        violations.append("单条超过 90 字")
-    limit = 150 if intent in ("vent", "help") else int(cfg["reply_max_chars"])
+    per_bubble = _override_num(ov, "max_chars_per_bubble")
+    if per_bubble is None:
+        per_bubble = 90
+    if any(len(b) > per_bubble for b in bubbles):
+        violations.append(f"单条超过 {per_bubble} 字")
+    limit = _override_num(ov, "max_chars_per_reply")
+    if limit is None:
+        limit = 150 if intent in ("vent", "help") else int(cfg["reply_max_chars"])
     if len(joined) > limit:
         violations.append("总字数超限")
     # 镜像上限加 60 字地板：persona 常态就是 20-60 字，他只回一两个字时
     # 她回一句常态长度不算「比他说的多太多」（旧口径 target*2 在他发
     # 「好」时只许 12 字，与常态基调直接冲突）。
-    if intent not in MIRROR_EXEMPT and len(joined) > max(ctx.get("target_len", 30) * 2, 60):
+    mirror_exempt = intent in MIRROR_EXEMPT or bool(ov and ov.get("mirror_exempt"))
+    if not mirror_exempt and len(joined) > max(ctx.get("target_len", 30) * 2, 60):
         violations.append("长度镜像超限（比他说的多太多）")
     if ctx.get("batch_question") and not ctx.get("answered"):
         violations.append("他问了问题但没有正面回答")
@@ -1030,7 +1498,11 @@ def check_candidate(bubbles, ctx):
 def score_candidate(bubbles, ctx):
     joined = "".join(bubbles)
     target = max(6, ctx.get("target_len", 30))
-    if ctx.get("intent") in MIRROR_EXEMPT:
+    ov = _intent_override(ctx.get("intent"))
+    if ctx.get("intent") in MIRROR_EXEMPT or \
+            (ov and (ov.get("flat_len_score") or ov.get("mirror_exempt"))):
+        # 豁免 intent 的长度分定值，不按 target 罚分（与 check 的
+        # 格式豁免同口径：生成端放行了、打分端不能再掐回来）
         len_score = 0.7
     else:
         len_score = 1 - min(1.0, abs(len(joined) - target) / target)
@@ -1156,6 +1628,9 @@ def build_prompt(batch, ctx_extra):
         f"\"self_facts\": [\"这轮里关于你自己的新信息，没有就空数组\"], "
         "\"memory_add\": [\"值得长期记住的、关于他的事\"], \"memory_remove\": [\"要删除的记忆原文\"], "
         "\"followups\": [{\"about\": \"值得之后主动接上的话题\", \"after_hours\": 24}], "
+        "\"episodes_add\": [{\"kind\": \"shared_experience/his_detail/emotion_event/"
+        "inside_joke/promise/anniversary 之一\", \"text\": \"这轮新发生的、值得长久记住的"
+        "共同经历，一句话，只写真实发生的\", \"date\": \"事件日期 YYYY-MM-DD，可省略\"}], "
         "\"mood_after\": \"这轮之后你的心情，只能填 烦躁/有点闷/有点累/平静/愉快/开心，"
         "且只能和当下心情相邻变化（对方夸你就往开心挪，对方敷衍扫兴就往有点闷挪；"
         "他在倾诉或情绪不好时填和现在一样的心情）\", "
@@ -1168,6 +1643,25 @@ def build_prompt(batch, ctx_extra):
         f"总字数尽量贴近 {target_len} 字。像真人发微信：口语、短句、先接情绪。"
         "如果他明显在倾诉或情绪很差，intent 填 vent；如果他流露自伤念头，intent 填 crisis，"
         "回复里要自然地带出 12356 和劝他联系身边的人。"]
+    # intent 格式豁免条件句：仅当部署者配置了 intent_overrides 才
+    # 生成（无配置不输出、任务口径与旧版一致）。数值只提配置了的项。
+    _ov_lines = []
+    _ovs = (cfg.get("limits") or {}).get("intent_overrides") or {}
+    if isinstance(_ovs, dict):
+        for _name, _spec in _ovs.items():
+            if not isinstance(_spec, dict):
+                continue
+            _bits = []
+            if _spec.get("max_chars_per_bubble") is not None:
+                _bits.append(f"单条可至 {_spec['max_chars_per_bubble']} 字")
+            if _spec.get("max_chars_per_reply") is not None:
+                _bits.append(f"总字数可至 {_spec['max_chars_per_reply']} 字")
+            _ov_lines.append(f"若本轮 intent 为 {_name}："
+                             + ("、".join(_bits) if _bits else "格式按部署者配置放宽")
+                             + "，不受贴近 target_len 约束，按场景写透。")
+    if _ov_lines:
+        parts_tail.append("=== intent 格式豁免（部署者配置） ===\n"
+                          + "\n".join(_ov_lines))
     prompt = "\n\n".join(parts_head + parts_mid + parts_hist + parts_tail)
     max_chars = int(cfg["llm"]["max_prompt_chars"])
     # 超长时按规格顺序截短：history → 示例 → 摘要 → 记忆
@@ -1318,6 +1812,10 @@ def compute_delay(intent, fast, life, total_chars):
 
 
 # ---------------- 主流程（规格 2.4） ----------------
+PROCESSED_BREAKER_MAX = 25  # 单批未处理上限：processed 损坏/回滚会让存量消息集体「未处理」；正常积压远小于此
+PROCESSED_ANSWERED_CHECK_MIN = 3  # 未处理超过此数才查已答复旁证（常态小批量免读全量 history）
+
+
 def load_processed():
     data = bridge.read_json(bridge.PROCESSED_FILE, {}) or {}
     return set(str(x) for x in data.get("processed", []))
@@ -1359,10 +1857,55 @@ def collect_unprocessed():
             msgs.append(m)
     msgs.sort(key=lambda m: (bridge._coerce_ms(m.get("create_time_ms")) or 0,
                              str(m.get("message_id"))))
+    if len(msgs) > PROCESSED_ANSWERED_CHECK_MIN:
+        # 兜底过滤：旁证显示已答复的消息不可能是新消息，必是
+        # processed 损坏/回滚——跳过防重答，并回填 processed 自愈。
+        answered = _already_answered_ids()
+        if answered:
+            kept = []
+            for m in msgs:
+                if str(m.get("message_id")) in answered:
+                    mark_processed([str(m["message_id"])])
+                    wlog(f"processed 兜底：{m['message_id']} 已有答复记录，"
+                         f"跳过并回填 processed")
+                else:
+                    kept.append(m)
+            msgs = kept
+    if len(msgs) > PROCESSED_BREAKER_MAX:
+        # 熔断：批量「未处理」激增是 processed 损坏/回滚的典型
+        # 签名；只放行最新一段，其余回填 processed 并记日志——
+        # 宁可漏答存量，不集体重答/重打分。
+        total = len(msgs)
+        skipped, msgs = msgs[:-PROCESSED_BREAKER_MAX], msgs[-PROCESSED_BREAKER_MAX:]
+        mark_processed([str(m["message_id"]) for m in skipped])
+        wlog(f"processed 熔断触发：未处理积压 {total} 条超上限 "
+             f"{PROCESSED_BREAKER_MAX}，跳过最旧 {len(skipped)} 条并回填")
     return msgs
 
 
-def write_outbox(batch, bubbles, delay, typing_sec):
+def _already_answered_ids():
+    """已答复旁证（processed 损坏/回滚时的兜底判重源）：history 里
+    role=assistant 的 message_id 集合 ∪ outbox/sent 文件名前缀。
+    正常流程里「已答复但未进 processed」不可能出现（worker 先
+    mark_processed、bridge 后发 history），故旁证命中即回滚/损坏
+    信号，跳过防重答。"""
+    ids = set()
+    try:
+        for h in bridge.read_jsonl(bridge.HISTORY_FILE):
+            if h.get("role") == "assistant" and h.get("message_id"):
+                ids.add(str(h["message_id"]))
+    except Exception:
+        pass
+    try:
+        for fn in os.listdir(bridge.SENT):
+            if fn.endswith(".json"):
+                ids.add(fn.split("-", 1)[0])
+    except OSError:
+        pass
+    return ids
+
+
+def write_outbox(batch, bubbles, delay, typing_sec, intent=None):
     cfg = bridge.cfg()
     latest = batch[-1]
     mid = str(latest["message_id"])
@@ -1373,11 +1916,20 @@ def write_outbox(batch, bubbles, delay, typing_sec):
         except OSError:
             pass
     send_after = time.time() + delay
-    for i, text in enumerate(bubbles[: int(cfg["max_bubbles"])]):
+    # intent 格式豁免：命中 intent_overrides 时气泡截断上限改用
+    # 覆盖值，且 intent 落盘到每条 outbox 条目——serve 数值硬门
+    # 据此判定豁免（与 bridge.numeric_gate_violation 同口径）；
+    # agent 模式由生成侧按 docs/agent-mode.md 同样落盘 intent。
+    cap = _override_num(_intent_override(intent), "max_bubbles")
+    if cap is None:
+        cap = int(cfg["max_bubbles"])
+    for i, text in enumerate(bubbles[:cap]):
         payload = {"to_user_id": latest.get("from_user_id", ""), "text": text,
                    "context_token": latest.get("context_token", ""), "message_id": mid,
                    "kind": "reply", "send_after": send_after,
                    "typing_sec": typing_sec if i == 0 else 0}
+        if intent:
+            payload["intent"] = intent
         bridge.atomic_write_json(os.path.join(bridge.PENDING, f"{mid}-{i + 1}.json"), payload)
     return True
 
@@ -1399,6 +1951,15 @@ def apply_side_effects(data, batch, crisis):
         if s and s not in facts:
             facts.append(s)
     save_list_file(FACTS_FILE, "facts", facts[-200:])
+    # 情景记忆落账（API 链）：dict 条目按 kind/text/date 落账，
+    # 纯字符串兜底 his_detail；判重与敏感纪律在 add_episode 内。
+    for item in data.get("episodes_add", []) or []:
+        if isinstance(item, dict):
+            add_episode(str(item.get("kind", "his_detail")),
+                        str(item.get("text", "")), item.get("date"),
+                        source="chat")
+        elif str(item).strip():
+            add_episode("his_detail", str(item), source="chat")
     fups = data.get("followups", []) or []
     if fups:
         with bridge.state_lock():
@@ -1571,7 +2132,8 @@ def run():
     bubbles = result["bubbles"]
     total_chars = sum(len(b) for b in bubbles)
     delay, typing = compute_delay(result.get("intent", "chat"), fast, life, total_chars)
-    wrote = write_outbox(batch, bubbles, delay, typing)
+    wrote = write_outbox(batch, bubbles, delay, typing,
+                         intent=result.get("intent", "chat"))
     # 步骤 13：收尾
     apply_side_effects(result.get("data"), batch, result.get("crisis", False))
     mark_processed(ids)
@@ -2441,6 +3003,11 @@ def build_pack():
         "realism": _realism_line(),
         "expressions": _expressions_line(),
         "daily_look": daily_look(),
+        "episodes": episodes_brief(),
+        # 场景形象修正全表下发：内容包 scene_looks.json 的每个场景
+        # 一条（妆容级别/发型覆盖），生成媒体时按场景取用；内容包
+        # 未提供映射时为空 dict。
+        "scene_look": {s: look_for_scene(s) for s in scene_look_map()},
     }
 
 
@@ -2449,15 +3016,20 @@ def cmd_prep(text=None, gap_sec=None):
     毛病闸门 + 隐式反馈打分），省掉 agent 流程里多次串行调用。"""
     out = {"brief": round_brief()}
     batch = collect_unprocessed()
-    imgs = [{"message_id": str(m.get("message_id")), "media_file": m["media_file"]}
+    imgs = [{"message_id": str(m.get("message_id")), "media_file": m["media_file"],
+             "media_files": m.get("media_files") or [m["media_file"]]}
             for m in batch if m.get("media_file")]
     if imgs:
-        out["images"] = imgs  # 本批已落盘的入站图片清单（回复前先读图）
+        out["images"] = imgs  # 本批已落盘的入站图片清单（多图全收，回复前逐张读图）
     vids = [{"message_id": str(m.get("message_id")),
-             "video_file": m.get("video_file"), "frames": m["video_frames"]}
-            for m in batch if m.get("video_frames")]
+             "video_file": m.get("video_file"),
+             "frames": m.get("video_frames") or [],
+             "meta": m.get("video_meta") or {},
+             "transcript": m.get("video_transcript") or "",
+             "transcript_status": m.get("video_transcript_status") or ""}
+            for m in batch if m.get("video_file")]
     if vids:
-        out["videos"] = vids  # 本批已抽帧的入站视频清单（回复前先读帧图）
+        out["videos"] = vids  # 本批入站视频清单：帧图＋元信息＋语音转写（视频简报）
     li = find_last_image()
     if li:
         out["last_image"] = li  # 最近一张他发的图（跨轮「照刚才那张画」的参考指针）
@@ -2469,8 +3041,28 @@ def cmd_prep(text=None, gap_sec=None):
     out["emotion_signal"] = emotion_signal(
         [m.get("text", "") for m in batch] or ([text] if text else []))
     out["two_stage_today"] = {"count": two_stage_today(), "cap": 2}
+    if text is None:
+        # agent 模式调 prep 不带 --text：从当前批次派生他的原话与
+        # 时延，恢复代码侧隐式反馈（只在显式传 text 时打分会让
+        # agent 模式的 feedback 长期零落盘、tune 快照失去输入）。
+        derived = "\n".join(str(m.get("text", "")) for m in batch
+                            if m.get("text"))
+        if derived:
+            text = derived
+            if gap_sec is None:
+                last0 = tune.last_reply_record()
+                if last0:
+                    gap_sec = time.time() - float(last0.get("ts", time.time()))
     if text is not None:
-        out["feedback"] = tune.auto_feedback(text, gap_sec=gap_sec)
+        if batch:
+            # 与领取路径共用统一入口：判重保证同批经 pending 已打
+            # 过时这里只回回执、不重复落盘
+            out["feedback"] = score_batch_feedback(batch)
+        else:
+            prev = tune.last_reply_record()
+            out["feedback"] = tune.auto_feedback(
+                text, gap_sec=gap_sec, last=prev,
+                user_avg_len=his_avg_len())
         af = auto_followup_scan(text)
         if af:
             out["followup_auto"] = af
@@ -2495,17 +3087,34 @@ def _pending_entries(exclude=None):
                  "recalled": bool(m.get("recalled"))}
         if m.get("media_file"):
             entry["media_file"] = m["media_file"]  # 入站图片已下载解密落盘的相对路径
-        if m.get("video_frames"):
+            entry["media_files"] = m.get("media_files") or [m["media_file"]]
+        if m.get("video_file"):
             entry["video_file"] = m.get("video_file")  # 入站视频已下载解密落盘的 mp4
-            entry["video_frames"] = m["video_frames"]  # 抽帧图相对路径（回复前先读帧图）
+            entry["video_frames"] = m.get("video_frames") or []  # 抽帧图相对路径（回复前先读帧图）
+            entry["video_meta"] = m.get("video_meta") or {}
+            entry["video_transcript"] = m.get("video_transcript") or ""
+            entry["video_transcript_status"] = \
+                m.get("video_transcript_status") or ""
         out.append(entry)
     return out
 
 
 def cmd_pending(exclude=None):
-    """只读复查：列出当前未处理消息（agent 流程在「落盘前复查」与
-    「轮尾续接」时调用，捞生成期间新到的连发消息）。"""
-    print(json.dumps(_pending_entries(exclude), ensure_ascii=False))
+    """列出当前未处理消息（agent 流程领取本轮与轮尾复查共用）。
+
+    领取（无 --exclude 的首领）附带一次学习打分：以本批他的消息
+    为反应给上一轮回复打分并落行为信号（score_batch_feedback，
+    判重兜底、重复领取不双计）——打分锚在每轮必经动作上，不再
+    依赖每日 prep 是否被执行。打分失败只记日志，绝不影响领取
+    本身的输出（仍为原条目列表，格式不变）。带 --exclude 的复查
+    调用不打分（那是找更新消息，不是领取）。"""
+    entries = _pending_entries(exclude)
+    if entries and not exclude:
+        try:
+            score_batch_feedback(collect_unprocessed())
+        except Exception as e:
+            wlog(f"领取打分异常（忽略）：{e}")
+    print(json.dumps(entries, ensure_ascii=False))
     return 0
 
 
@@ -2646,13 +3255,47 @@ def cmd_finish(mood=None, joke_used=None, joke_add=None, flaw_used=False,
         # 沉淀提示（L5）：memory/梗库存量曾长期近空转，收尾时显式提醒
         # 执行体把本轮新出现的他的事实/新梗/未闭环话题一并落账。
         res["settle_hint"] = ("本轮若出现值得记的他的新事实、新梗或未闭环"
-                              "话题，收尾时一并落账（口径照旧，不新编）")
+                              "话题，收尾时一并落账（口径照旧，不新编）；"
+                              "共同经历类（一起经历的事、他的生活细节、"
+                              "情绪事件、约定、纪念日）用 episode-add "
+                              "落 episodes")
     try:
         res["pending"] = _pending_entries()
         res["pending_ok"] = True
     except Exception as e:  # 底层全容错、理论不可达，仍如实标记不吞
         res["pending_error"] = f"{type(e).__name__}: {e}"
     print(json.dumps(res, ensure_ascii=False))
+    return 0
+
+
+def cmd_episode_add(kind=None, text=None, date=None, source="chat"):
+    res = add_episode(kind or "his_detail", text or "", date, source=source)
+    print(json.dumps(res, ensure_ascii=False))
+    return 0 if res.get("added") else 1
+
+
+def cmd_episodes(limit=10):
+    items = [e for e in load_episodes()
+             if e.get("status", "active") == "active"]
+    out = {"active": len(items),
+           "archived": len(load_episodes()) - len(items),
+           "recent": [{"kind": e.get("kind"), "text": e.get("text"),
+                       "date": e.get("date"), "added": e.get("added"),
+                       "source": e.get("source")}
+                      for e in items[-int(limit):]]}
+    print(json.dumps(out, ensure_ascii=False))
+    return 0
+
+
+def cmd_learn_report(write=False):
+    rep = learn_report()
+    if write:
+        row = {"date": today_local().date().isoformat(),
+               "kind": "learn_visibility", **rep}
+        bridge.append_jsonl(LEARN_DAILY_FILE, row)
+        bridge.write_json_locked(TOPIC_PREF_FILE, rep["topic_pref"])
+        rep = {**rep, "written": LEARN_DAILY_FILE}
+    print(json.dumps(rep, ensure_ascii=False))
     return 0
 
 
@@ -2697,6 +3340,17 @@ def main(argv=None):
     pd_ = sub.add_parser("pending")
     pd_.add_argument("--exclude", default=None,
                      help="逗号分隔的 message_id，本批已包含的不列出")
+    ea = sub.add_parser("episode-add")
+    ea.add_argument("--kind", default="his_detail", choices=list(EPISODE_KINDS))
+    ea.add_argument("--text", required=True)
+    ea.add_argument("--date", default=None,
+                    help="事件日期 YYYY-MM-DD（约定/纪念日用），缺省今天")
+    ea.add_argument("--source", default="chat")
+    ep = sub.add_parser("episodes")
+    ep.add_argument("--limit", type=int, default=10)
+    lr = sub.add_parser("learn-report")
+    lr.add_argument("--write", action="store_true",
+                    help="把报告追加进 learn_daily.jsonl 并刷新 topic_pref.json")
     po = sub.add_parser("post")
     po.add_argument("--mood", default=None)
     po.add_argument("--joke-used", default=None)
@@ -2774,6 +3428,13 @@ def main(argv=None):
     if args.cmd == "pending":
         excl = [x for x in (args.exclude or "").split(",") if x]
         return cmd_pending(exclude=excl)
+    if args.cmd == "episode-add":
+        return cmd_episode_add(kind=args.kind, text=args.text,
+                               date=args.date, source=args.source)
+    if args.cmd == "episodes":
+        return cmd_episodes(limit=args.limit)
+    if args.cmd == "learn-report":
+        return cmd_learn_report(write=args.write)
     if args.cmd == "post":
         return cmd_post(mood=args.mood, joke_used=args.joke_used,
                         joke_add=args.joke_add, flaw_used=args.flaw_used,

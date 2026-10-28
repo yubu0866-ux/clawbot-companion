@@ -129,27 +129,56 @@ def silence_window(pcfg=None):
 # video_sends_today 只作台账统计，不把关
 
 
+def _quarantine_corrupt(path):
+    """损坏 state 文件留痕（与 bridge.read_json 同口径）：改名
+    <path>.corrupt-<unix秒> 保全证据，防吞错后空数据写回静默清零。
+    最佳努力，失败静默。同秒唯一命名与 bridge 同口径：同文件同秒
+    再次损坏时基础名后加 -<pid>、再撞加 -2/-3…，不覆盖前一份证据。"""
+    try:
+        base = f"{path}.corrupt-{int(time.time())}"
+        dst = base
+        if os.path.exists(dst):
+            dst = f"{base}-{os.getpid()}"
+            n = 2
+            while os.path.exists(dst):
+                dst = f"{base}-{os.getpid()}-{n}"
+                n += 1
+        os.replace(path, dst)
+        return dst
+    except OSError:
+        return None
+
+
 def read_json(path, default=None):
     # 只认 dict 顶层：本桥全部单文件 JSON 存储按构造都是对象；顶层是
-    # 裸标量/数组属损坏形态，透传会让下游 .get 消费者崩溃（bughunt2-
-    # 2026-10-25 实证 counters.json=5 时 get_unreplied AttributeError），
-    # 与解析失败同口径回 default。
+    # 裸标量/数组属损坏形态，透传会让下游 .get 消费者崩溃（实证：
+    # counters.json=5 时消费者 AttributeError），与解析失败同口径回
+    # default。解析失败/非对象顶层先留痕，OSError（文件不存在等
+    # 常态）不留痕。
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, ValueError):
+    except OSError:
         return default
-    return data if isinstance(data, dict) else default
+    except ValueError:
+        _quarantine_corrupt(path)
+        return default
+    if not isinstance(data, dict):
+        _quarantine_corrupt(path)
+        return default
+    return data
 
 
 def write_json(path, data):
     # tmp 名必须按写者唯一：固定 ".tmp" 时两个并发写者共用同一临时文件，
     # 一方的 os.replace 会把另一方的 tmp 抢走 → 对方 FileNotFoundError
-    # 崩溃（bughunt-2026-10-24 面 1 实证），与 bridge.atomic_write_json 同口径
+    # 崩溃（实证），与 bridge.atomic_write_json 同口径
     tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())  # 与 bridge.atomic_write_json 对齐
     except Exception:
         try:
             os.remove(tmp)
@@ -157,6 +186,13 @@ def write_json(path, data):
             pass
         raise
     os.replace(tmp, path)
+    if hasattr(os, "O_DIRECTORY"):  # 目录 fsync 仅 POSIX
+        try:
+            dfd = os.open(os.path.dirname(path) or ".", os.O_DIRECTORY)
+            os.fsync(dfd)
+            os.close(dfd)
+        except OSError:
+            pass
 
 
 def read_jsonl(path):

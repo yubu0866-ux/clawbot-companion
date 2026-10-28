@@ -29,6 +29,7 @@ SUITES = [
     "selftest_worker.py",
     "selftest_pressure.py",
     "selftest_channel.py",
+    "selftest_round28.py",
 ]
 TIMEOUT = 1800
 

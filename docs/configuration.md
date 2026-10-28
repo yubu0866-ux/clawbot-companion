@@ -121,7 +121,47 @@
 | `limits.max_bracket_expressions` | number | 整轮方括号表情（如 `[微笑]`）数上限（默认 2） |
 | `limits.bracket_window_rounds` | number | 方括号表情的滚动统计窗口（最近 N 个回复轮次，默认 5） |
 | `limits.max_bracket_in_window` | number | 窗口内方括号表情合计上限（默认 4） |
-| `limits.max_media_per_reply` | number | 单轮媒体条数上限（默认 1） |
+| `limits.max_media_per_reply` | number \| null | 单轮媒体条数上限。`null`（示例默认）＝不单独设上限：媒体条不计气泡、只受整轮字数等其余口径约束；填整数恢复上限 |
+| `limits.intent_overrides` | object | 按 intent 名配置的格式豁免，部署者自定，默认 `{}`（无豁免、行为与旧版一致）。见下 |
+
+`intent_overrides` 的值形如 `{intent 名: {max_bubbles, max_chars_per_bubble, max_chars_per_reply, mirror_exempt, flat_len_score}}`，字段可缺省（缺省项回落常态值）。当某一轮的 intent 命中条目时：bridge 数值硬门与 worker 的候选校验（check_candidate）、打分（score_candidate）、提示词组装、outbox 截断与 intent 落盘**共用同一条目**——气泡/单条/整轮三项改用覆盖值，`mirror_exempt=true` 时跳过长度镜像上限，`flat_len_score=true` 时长度分定值不按目标长度罚分；卫生项（问号/emoji/方括号表情）永不豁免。示例写法（数字仅示意格式，不构成推荐值）：
+
+```json
+"intent_overrides": {
+  "playful": {"max_bubbles": 5, "max_chars_per_bubble": 150,
+              "max_chars_per_reply": 600, "mirror_exempt": true,
+              "flat_len_score": true}
+}
+```
+
+### 情景记忆与学习环（`worker` 段与 state 文件）
+
+`config.json` 的 `worker` 段是 worker.py 的行为参数，全部可选、缺失用默认：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `worker.two_stage_probability` | number | 两段式（先发忙碌占位、稍后补真回复）的触发概率（默认 0.25），其余条件（当下在忙、每日 ≤2 次等）不变；每次判定（含未触发）落 `state/two_stage_log.jsonl` 审计 |
+| `worker.episodes_cap` | number | 情景记忆 active 条数上限（默认 150），超出归档最旧的普通条目；`promise`/`anniversary` 两类不自动归档 |
+| `worker.episodes_brief_recent` | number | 简报回提的近期共同经历条数（默认 3，按日轮换） |
+| `worker.episodes_brief_upcoming` | number | 简报回提的临近约定/纪念日条数（默认 2） |
+| `worker.episodes_upcoming_window_days` | number | 约定/纪念日的回提窗口天数（默认 7） |
+| `worker.rhythm_cv_hint_below` | number | 近期气泡句长变异系数低于此值时，简报提示生成端长短交错（默认 0.40） |
+
+相关机制与状态文件（全部只存本地 `state/`，不上传；删除对应文件即清除该部分状态）：
+
+- **情景记忆 episodes**（`state/episodes.json`）：与 facts 分工——facts 存稳定事实，episodes 存共同经历事件，分 6 类（`shared_experience` 一起经历的事 / `his_detail` 对方生活细节 / `emotion_event` 情绪事件 / `inside_joke` 两人之间的梗 / `promise` 约定 / `anniversary` 纪念日）。只许来自真实聊天：落账走三层判重（与既有 episode 互含/相似度、与 facts 档案互含）、含敏感信息（密码/证件/验证码等）拒落。捕获三路：当轮经生成输出的 `episodes_add` 或 `worker.py episode-add` 命令、每日摘要抽取、以及部署方可选的每周固化任务（把一周散记合并落账，抽取口径须与每日摘要一致：各类事件同等收录、不因题材淡化略过）。简报回提按上面的条数/窗口配置执行，「自然带出、不背诵」。
+- **学习环**：隐式反馈打分锚在每轮必经的领取动作上（`worker.py pending` 首领、`prep`、`run` 共用同一入口），同一批消息重复进入只落一次（批次键判重）；行为信号落 `state/signals.jsonl`（回复时延/字数/是否被逗笑/是否索要媒体/是否提问），聚合为话题偏好进简报；`worker.py learn-report [--write]` 随时查看学习环是否在学（反馈覆盖、逐旋钮 promote 门槛评估），`--write` 时把可见性快照追加进 `state/learn_daily.jsonl` 并刷新 `state/topic_pref.json`。
+
+### stt（入站视频转写，可选）
+
+`config.json` 的 `stt` 段由 bridge 的入站视频理解管线实读：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `stt.model` | string | faster-whisper 模型名（默认 `base`） |
+| `stt.language` | string | 转写语言提示（如 `zh` / `en`，默认 `zh`） |
+
+转写只在找到 STT 运行时才执行，解析顺序：环境变量 `COMPANION_STT_PYTHON` → 程序同级 `stt-venv` → `~/stt-venv` → serve 解释器本身（装有 faster-whisper 时）。都没有时视频管线如实降级为只抽帧（转写状态 `failed`，简报按状态说话、不编台词）。入站视频的五档转写状态为 `ok / partial / no_audio / no_speech / failed`；转写异步回填，最长回看 24 小时内的待转写视频。入站媒体原件的保留清理见 `scripts/prune_media_in.sh`（有文字留档才删、默认 dry-run）。
 
 ### media（可选接入约定）
 

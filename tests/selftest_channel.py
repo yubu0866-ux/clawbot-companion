@@ -592,10 +592,10 @@ try:
           and _queue[0]["due_at"] > time.time(),
           f"queue={len(_queue)}")
     # 清扫成功路径：假下载成功 + inbox 记录回填 + 提示记录 + history + 触发
-    _orig_fetch_img = mod._fetch_inbound_image
+    _orig_fetch_img = mod._fetch_inbound_images
     _orig_touch = mod.touch_trigger_and_spawn_worker
     _touch_n = {"n": 0}
-    mod._fetch_inbound_image = lambda msg, log=None: ("state/media_in/RF1.jpg", _cred_img)
+    mod._fetch_inbound_images = lambda msg, log=None: (["state/media_in/RF1.jpg"], _cred_img)
     mod.touch_trigger_and_spawn_worker = lambda *a, **k: _touch_n.__setitem__("n", _touch_n["n"] + 1)
     wj(os.path.join(TMP, "inbox", "RF1.json"),
        {"message_id": "RF1", "type": "image", "text": "", "from_user_id": USER_ID,
@@ -617,7 +617,7 @@ try:
           and ((rj(_rq, {}) or {}).get("entries") or []) == [],
           f"rec={_rec_rf1.get('media_file')} note={_note_rf1.get('type')} touch={_touch_n['n']}")
     # 清扫失败路径：一次为限，条目出队且不留提示记录
-    mod._fetch_inbound_image = lambda msg, log=None: (None, _cred_img)
+    mod._fetch_inbound_images = lambda msg, log=None: ([], _cred_img)
     mod._schedule_inbound_refetch("RF2", "image", _cred_img, log=lambda *a: None)
     _q = rj(_rq, {})
     _q["entries"][0]["due_at"] = time.time() - 1
@@ -625,7 +625,7 @@ try:
     mod._INBOUND_REFETCH_LAST[0] = 0.0
     _rf_log = []
     mod._inbound_refetch_sweep(log=lambda m: _rf_log.append(m))
-    mod._fetch_inbound_image = _orig_fetch_img
+    mod._fetch_inbound_images = _orig_fetch_img
     mod.touch_trigger_and_spawn_worker = _orig_touch
     check("T12m-4 补取失败一次为限：出队放弃、留日志痕迹、无提示记录",
           ((rj(_rq, {}) or {}).get("entries") or []) == []
@@ -640,15 +640,39 @@ try:
         return d
 
     _v = mod.numeric_gate_violation
-    check("T12n-1 硬门合规组放行、气泡/单条/问号/emoji/方括号/媒体逐项拦截",
+    # 媒体口径（示例配置 max_media_per_reply=null）：媒体条不计气泡、
+    # 媒体数不单独设上限——多媒体组放行；上限回归见 T12n-1b。
+    check("T12n-1 硬门合规组放行、气泡/单条/问号/emoji/方括号逐项拦截、多媒体不限",
           _v([_gi("你好呀"), _gi("今天也辛苦啦")]) is None
           and "气泡" in _v([_gi("a"), _gi("b"), _gi("c"), _gi("d")])
           and "单条" in _v([_gi("x" * 91)])
           and "问号" in _v([_gi("好吗？真的？行吗？")])
           and "emoji" in _v([_gi("😀😀😀")])
           and "方括号" in _v([_gi("[偷笑][偷笑][偷笑]")])
-          and "媒体" in _v([_gi("（图）", media_file="/tmp/a.jpg"),
-                             _gi("（图）", media_file="/tmp/b.jpg")]))
+          and _v([_gi("说"), _gi("（图）", media_file="/tmp/a.jpg"),
+                  _gi("（图）", media_file="/tmp/b.jpg")]) is None)
+    mod.cfg()["limits"]["max_media_per_reply"] = 1
+    try:
+        _cap_media = _v([_gi("（图）", media_file="/tmp/a.jpg"),
+                         _gi("（图）", media_file="/tmp/b.jpg")])
+    finally:
+        mod.cfg()["limits"]["max_media_per_reply"] = None
+    check("T12n-1b max_media_per_reply 填整数时媒体数上限恢复",
+          _cap_media is not None and "媒体" in _cap_media)
+    mod.cfg()["limits"]["intent_overrides"] = {
+        "playful": {"max_bubbles": 5, "max_chars_per_bubble": 150,
+                    "max_chars_per_reply": 600}}
+    try:
+        _ov_group = [_gi("长" * 100, intent="playful"),
+                     _gi("二"), _gi("三"), _gi("四")]
+        _ov_ok = _v(_ov_group) is None
+        _ov_hygiene = _v([_gi("好吗？真的？行吗？", intent="playful")])
+        _ov_over = _v([_gi("长" * 151, intent="playful")])
+    finally:
+        mod.cfg()["limits"]["intent_overrides"] = {}
+    check("T12n-1c intent_overrides：命中 intent 整组三项放宽、卫生项不放宽、超覆盖仍拦",
+          _ov_ok and _ov_hygiene is not None and "问号" in _ov_hygiene
+          and _ov_over is not None and "单条" in _ov_over)
     check("T12n-2 硬门近 5 轮方括号滚动口径与占位符豁免",
           _v([_gi("好[偷笑]")], recent_brackets=3) is None
           and "近5轮" in _v([_gi("好[偷笑]")], recent_brackets=4)

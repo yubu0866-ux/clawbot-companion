@@ -43,6 +43,7 @@ libcrypto 的 find_library 口径）在 Windows 上自动切换为等价断言�
 | selftest_pressure | 收录·适配（15 项） | 仅 config 改 example、保留目录环境变量改名。 |
 | fake_llm.py / fake_fail.py | 收录·适配 | 保留 stdin 罐头模式；新增 `--serve PORT` 的 OpenAI 兼容 HTTP 模式（见 worker 条）。 |
 | selftest_daily_look | 改写收录（21 项） | 源套件对个人内容包做全量断言（套装总数、专属字段、场景总数、动作/表情例库逐项），与示例包不匹配。用示例包重写：类别（通勤/日常/居家）与妆容级别（通勤淡妆/日常淡妆/素颜/正式妆）落定、同日确定性、工作日/周末映射、`_pick_outfit` 的 7 天避重与季节过滤（构造用例）、`scene_looks.json` 映射与回落、内容包缺失降级。示例包每类仅 1 套，「14 天不重复」断言降级为映射正确性，避重逻辑由构造用例承接。 |
+| selftest_round28 | 新增（42 项） | 2026-10-28 同步批的回归锁：情景记忆 episodes（落账/三层判重/敏感拒/kind 兜底/上限归档/简报回提）、真人感供给（opener 冷却/rhythm 节奏/stance 缺口/round_brief 新键）、学习环（统一打分入口 + batch_key 判重、signals/topic_pref、learn-report、pending 领取锚点）、两段式概率 0.25 与判定审计、intent 格式豁免（check/score/write_outbox/build_pack，数值与示例均为通用口径）、processed 熔断与旁证自愈、损坏隔离同秒唯一命名、outbox 豁免、append_jsonl 半行、_prune_history fsync、磁盘低位、媒体完整性、STT 解析、media_screen/realism_audit/prune_media_in 脚本与 episode-add/learn-report CLI。源套件（个人版 round15/16/17/19/20/24/26）与个人部署形态强绑定（hook/cron 定义、专名 fixture、私有数值），按本表惯例改写为通用等价断言收录；部署形态类用例（cron manifest、hook 定义一致性）不收录。 |
 | selftest_content_lint | 剔除 | 全套是对个人内容文件（衣橱/质感/表情等卡的计数、私人音色参考、个人版规程与人设文本）的逐项 lint，通用版无对应文件；示例内容包的结构校验已由 daily_look 改写版与 brief_battery 的场景名单断言覆盖。 |
 | selftest_state_backup | 剔除 | 测 `scripts/backup_state.sh`、异地加密备份与 prune 脚本，通用版无这些脚本与机制。 |
 

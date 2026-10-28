@@ -453,7 +453,7 @@ def c2(home_w, w):
     hist = [{"role": "user", "text": "跨年夜聊了很久", "ts": ts(2026, 12, 31, 23, 59)},
             {"role": "user", "text": "新年第一句", "ts": ts(2027, 1, 1, 0, 1)},
             {"role": "user", "text": "前天的话", "ts": ts(2026, 12, 30, 23, 0)}]
-    text, _unf = w.summarize_yesterday(hist)
+    text, _unf, _eps = w.summarize_yesterday(hist)
     check("C2c-1 summarize_yesterday 跨年只取 2026-12-31 全天",
           text == "跨年摘要" and prompts
           and "跨年夜聊了很久" in prompts[0]

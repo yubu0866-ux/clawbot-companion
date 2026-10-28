@@ -22,6 +22,7 @@ selftest_life.py
 selftest_worker.py
 selftest_pressure.py
 selftest_channel.py
+selftest_round28.py
 "
 
 LOGDIR="$(mktemp -d)"

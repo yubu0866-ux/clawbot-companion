@@ -70,14 +70,33 @@ GENERIC_EVENTS = [
 ]
 
 
+def _quarantine_corrupt(path):
+    """损坏 state 文件留痕（与 bridge.read_json 同口径）：改名
+    <path>.corrupt-<unix秒> 保全证据，防吞错后空数据写回静默清零。
+    最佳努力，失败静默。"""
+    try:
+        dst = f"{path}.corrupt-{int(time.time())}"
+        os.replace(path, dst)
+        return dst
+    except OSError:
+        return None
+
+
 def read_json(path, default=None):
-    # 与 proactive.read_json 同口径：只认 dict 顶层，损坏回 default
+    # 与 proactive.read_json 同口径：只认 dict 顶层，损坏回 default；
+    # 解析失败/非对象顶层先留痕，OSError 常态不留痕。
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, ValueError):
+    except OSError:
         return default
-    return data if isinstance(data, dict) else default
+    except ValueError:
+        _quarantine_corrupt(path)
+        return default
+    if not isinstance(data, dict):
+        _quarantine_corrupt(path)
+        return default
+    return data
 
 
 def write_json(path, data):
@@ -85,6 +104,8 @@ def write_json(path, data):
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())  # 与 bridge.atomic_write_json 对齐
     except Exception:
         try:
             os.remove(tmp)
@@ -92,6 +113,13 @@ def write_json(path, data):
             pass
         raise
     os.replace(tmp, path)
+    if hasattr(os, "O_DIRECTORY"):  # 目录 fsync 仅 POSIX
+        try:
+            dfd = os.open(os.path.dirname(path) or ".", os.O_DIRECTORY)
+            os.fsync(dfd)
+            os.close(dfd)
+        except OSError:
+            pass
 
 
 def read_jsonl(path):

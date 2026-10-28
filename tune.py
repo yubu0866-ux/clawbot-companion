@@ -26,6 +26,7 @@ import argparse
 import base64
 import binascii
 import functools
+import hashlib
 import json
 import os
 import re
@@ -295,27 +296,48 @@ def today_str():
     return datetime.now(tz()).date().isoformat()
 
 
+def _quarantine_corrupt(path):
+    """损坏 state 文件留痕（与 bridge.read_json 同口径）：改名
+    <path>.corrupt-<unix秒> 保全证据，防吞错后空数据写回静默清零。
+    最佳努力，失败静默。"""
+    try:
+        dst = f"{path}.corrupt-{int(time.time())}"
+        os.replace(path, dst)
+        return dst
+    except OSError:
+        return None
+
+
 def read_json(path, default=None):
     # 只认 dict 顶层：本桥全部单文件 JSON 存储按构造都是对象；顶层是
-    # 裸标量/数组属损坏形态，透传会让下游 .get 消费者崩溃（bughunt2-
-    # 2026-10-25 实证 counters.json=5 时 get_unreplied AttributeError），
-    # 与解析失败同口径回 default。
+    # 裸标量/数组属损坏形态，透传会让下游 .get 消费者崩溃（实证：
+    # counters.json=5 时消费者 AttributeError），与解析失败同口径回
+    # default。解析失败/非对象顶层先留痕，OSError（文件不存在等
+    # 常态）不留痕。
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, ValueError):
+    except OSError:
         return default
-    return data if isinstance(data, dict) else default
+    except ValueError:
+        _quarantine_corrupt(path)
+        return default
+    if not isinstance(data, dict):
+        _quarantine_corrupt(path)
+        return default
+    return data
 
 
 def write_json(path, data):
     # tmp 名必须按写者唯一：固定 ".tmp" 时两个并发写者共用同一临时文件，
     # 一方的 os.replace 会把另一方的 tmp 抢走 → 对方 FileNotFoundError
-    # 崩溃（bughunt-2026-10-24 面 1 实证），与 bridge.atomic_write_json 同口径
+    # 崩溃（实证），与 bridge.atomic_write_json 同口径
     tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())  # 与 bridge.atomic_write_json 对齐
     except Exception:
         try:
             os.remove(tmp)
@@ -323,6 +345,13 @@ def write_json(path, data):
             pass
         raise
     os.replace(tmp, path)
+    if hasattr(os, "O_DIRECTORY"):  # 目录 fsync 仅 POSIX
+        try:
+            dfd = os.open(os.path.dirname(path) or ".", os.O_DIRECTORY)
+            os.fsync(dfd)
+            os.close(dfd)
+        except OSError:
+            pass
 
 
 def read_jsonl(path):
@@ -346,8 +375,20 @@ def read_jsonl(path):
 
 
 def append_jsonl(path, obj):
+    # 与 bridge.append_jsonl 同口径：防无换行半行与新记录拼行被读层
+    # 整行丢弃。
+    prefix = ""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            if f.tell() > 0:
+                f.seek(-1, os.SEEK_END)
+                if f.read(1) != b"\n":
+                    prefix = "\n"
+    except OSError:
+        pass
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        f.write(prefix + json.dumps(obj, ensure_ascii=False) + "\n")
 
 
 _LOCK_FD = None
@@ -608,11 +649,31 @@ def last_reply_record():
     return recs[-1] if recs else None
 
 
-def auto_feedback(new_text, gap_sec=None, last=None, user_avg_len=None):
-    """按代码规则给她的上一条回复打分，应用旋钮提示并更新偏好。返回结果 dict。"""
+def auto_feedback(new_text, gap_sec=None, last=None, user_avg_len=None,
+                  batch_key=None):
+    """按代码规则给她的上一条回复打分，应用旋钮提示并更新偏好。返回结果 dict。
+
+    判重：同一条回复被同一批他的消息重复打分只落一次。身份 =
+    reply_id + batch_key（调用方给的批次键，通常为批次末条
+    message_id）；无 batch_key 时退化用 reply_id + 文本哈希。多入口
+    （prep / pending 领取 / run 循环）都可能对同一批重复进入本函数，
+    无判重时旋钮提示与偏好会被重复应用；命中判重时返回原条结果并
+    标 dedup=True，不再重复 apply。"""
     last = last or last_reply_record()
     if not last:
         return {"score": 0, "reason": "没有上一条回复", "applied": {}}
+    reply_id = (last.get("batch_ids") or [""])[-1]
+    text_hash = hashlib.sha1(
+        (new_text or "").strip().encode("utf-8")).hexdigest()[:16]
+    for e in read_jsonl(FEEDBACK_FILE)[-80:]:
+        if e.get("source") != "code" or e.get("reply_id") != reply_id:
+            continue
+        if (batch_key and e.get("batch_key") == batch_key) or \
+                (not batch_key and not e.get("batch_key")
+                 and e.get("text_hash") == text_hash):
+            return {"score": e.get("score", 0), "reason": e.get("reason", ""),
+                    "applied": {}, "features": e.get("features"),
+                    "dedup": True}
     reply_text = str(last.get("reply", ""))
     feats = extract_features(reply_text,
                              n_bubbles=max(1, reply_text.count(" ") + 1) if reply_text else 1)
@@ -675,9 +736,10 @@ def auto_feedback(new_text, gap_sec=None, last=None, user_avg_len=None):
         applied[k] = adjust(k, d)
     if lock_questions:
         applied["questions"] = set_value("questions", 0, lock_hours=24)
-    entry = {"ts": time.time(), "reply_id": (last.get("batch_ids") or [""])[-1],
+    entry = {"ts": time.time(), "reply_id": reply_id,
              "score": score, "reason": "；".join(reasons) or "无明显信号",
-             "features": feats, "source": "code"}
+             "features": feats, "source": "code",
+             "batch_key": batch_key, "text_hash": text_hash}
     append_jsonl(FEEDBACK_FILE, entry)
     if score:
         update_pref(score, feats)
